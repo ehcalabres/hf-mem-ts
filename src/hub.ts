@@ -3,6 +3,10 @@ import { assertPositiveInteger, checkedFetch, fetchJson, mapLimit } from "./http
 import { estimateSafetensorsKvCache } from "./kv-cache.js";
 import { fetchSafetensorsHeader, parseSafetensorsHeaders, type SafetensorsHeader } from "./safetensors.js";
 import type { DraftModelOptions, EstimateOptions, EstimateResult, FileEstimate, FetchLike, HubFile, MmprojEstimate, WeightMetadata } from "./types.js";
+import { requestPolicy, transportFetch, type RequestPolicy } from "./transport.js";
+
+type ModelOptions = Required<Pick<EstimateOptions, "modelId" | "revision" | "batchSize" | "concurrency" | "hubUrl">>
+  & EstimateOptions & { requestedRevision: string };
 
 const SHARD = /(.+)-(\d+)-of-(\d+)\.gguf$/i;
 
@@ -15,14 +19,24 @@ function requestHeaders(token?: string): Record<string, string> {
 async function listFiles(fetcher: FetchLike, hub: string, modelId: string, revision: string, headers: HeadersInit): Promise<string[]> {
   let url: string | null = `${hub}/api/models/${urlPath(modelId)}/tree/${encodeURIComponent(revision)}?recursive=true&expand=false&limit=1000`;
   const paths: string[] = [];
+  const first = new URL(url);
+  const seen = new Set<string>();
   while (url) {
+    const page = new URL(url);
+    if (page.origin !== first.origin || page.pathname !== first.pathname || page.username || page.password) {
+      throw new Error("Unsafe Hub pagination URL: next page must use the same repository tree and origin.");
+    }
+    page.hash = "";
+    page.searchParams.sort();
+    if (seen.has(page.href)) throw new Error("Hub pagination loop detected.");
+    seen.add(page.href);
     const response = await checkedFetch(fetcher, url, { headers });
     const files = await response.json() as HubFile[];
     paths.push(...files.filter((file) => file.type === "file").map((file) => file.path));
     const link = response.headers.get("link");
     const next = link?.split(",").find((part) => /rel="?next"?/.test(part));
     const match = next?.match(/<([^>]+)>/);
-    url = match?.[1] ?? null;
+    url = match ? new URL(match[1]!, url).href : null;
   }
   return [...new Set(paths)];
 }
@@ -94,7 +108,7 @@ async function safetensorsPaths(
 }
 
 async function estimateSafetensors(
-  options: Required<Pick<EstimateOptions, "modelId" | "revision" | "batchSize" | "concurrency" | "hubUrl">> & EstimateOptions,
+  options: ModelOptions,
   fetcher: FetchLike, files: string[], headers: HeadersInit,
 ): Promise<EstimateResult> {
   const paths = await safetensorsPaths(fetcher, options.hubUrl, options.modelId, options.revision, files, headers, options.concurrency);
@@ -117,7 +131,7 @@ async function estimateSafetensors(
     });
   }
   return {
-    modelId: options.modelId, revision: options.revision, format: "safetensors", filename: null,
+    modelId: options.modelId, revision: options.requestedRevision, resolvedRevision: options.revision, format: "safetensors", filename: null,
     weightsBytes: metadata.bytes, kvCacheBytes: kvCache?.bytes ?? null,
     totalBytes: metadata.bytes + (kvCache?.bytes ?? 0), files: { safetensors: emptyFile(metadata, kvCache) },
     mmproj: null, draft: null,
@@ -138,28 +152,54 @@ function mergeMetadata(target: FileEstimate | undefined, next: FileEstimate): Fi
   return { parameters: target.parameters + next.parameters, bytes: target.bytes + next.bytes, components, kvCache: target.kvCache ?? next.kvCache };
 }
 
-async function estimateGguf(
-  options: Required<Pick<EstimateOptions, "modelId" | "revision" | "batchSize" | "concurrency" | "hubUrl">> & EstimateOptions,
-  fetcher: FetchLike, allFiles: string[], headers: HeadersInit,
-): Promise<EstimateResult> {
-  let paths = allFiles.filter((path) => path.toLowerCase().endsWith(".gguf") && !path.toLowerCase().includes("mmproj-"));
-  if (!paths.length) throw new Error(`No GGUF files found in ${options.modelId}@${options.revision}.`);
-  if (options.ggufFile) {
-    const shard = options.ggufFile.match(SHARD);
-    if (shard) {
-      const prefix = shard[1]!;
-      paths = paths.filter((path) => path.match(SHARD)?.[1] === prefix || path.match(SHARD)?.[1]?.endsWith(`/${prefix}`));
-    } else {
-      paths = paths.filter((path) => path === options.ggufFile || path.endsWith(`/${options.ggufFile}`));
-    }
-    if (!paths.length) throw new Error(`No GGUF file matching ${options.ggufFile} was found.`);
-    if (!shard && paths.length > 1) throw new Error(`Multiple GGUF files matching ${options.ggufFile} were found; pass the full path.`);
+function isMmproj(path: string): boolean {
+  return /(?:^|\/)mmproj[^/]*\.gguf$/i.test(path);
+}
+
+function ggufPaths(allFiles: string[], requested: string | undefined): string[] {
+  let paths = allFiles.filter((path) => path.toLowerCase().endsWith(".gguf") && !isMmproj(path));
+  if (requested) {
+    const matches = paths.filter((path) => path === requested || path.endsWith(`/${requested}`));
+    if (!matches.length) throw new Error(`No GGUF file matching ${requested} was found.`);
+    if (matches.length > 1) throw new Error(`Multiple GGUF files matching ${requested} were found; pass the full path.`);
+    const selected = matches[0]!;
+    const shard = selected.match(SHARD);
+    paths = shard ? paths.filter((path) => path.match(SHARD)?.[1] === shard[1] || path === `${shard[1]}.gguf`) : [selected];
   }
+  if (!paths.length) throw new Error("No GGUF model files found.");
+  const groups = new Map<string, { count: number; indices: Set<number> }>();
+  const singles = new Set(paths.filter((path) => !SHARD.test(path)));
+  for (const path of paths) {
+    const shard = path.match(SHARD);
+    if (!shard) continue;
+    const index = Number(shard[2]);
+    const count = Number(shard[3]);
+    const name = `${shard[1]}.gguf`;
+    if (!Number.isSafeInteger(count) || count < 1 || !Number.isSafeInteger(index) || index < 1 || index > count) {
+      throw new Error(`Invalid GGUF shard index or count: ${path}.`);
+    }
+    if (singles.has(name)) throw new Error(`Ambiguous GGUF group ${name}: both sharded and unsharded files exist.`);
+    const group = groups.get(name) ?? { count, indices: new Set<number>() };
+    if (group.count !== count) throw new Error(`Inconsistent GGUF shard counts for ${name}.`);
+    if (group.indices.has(index)) throw new Error(`Duplicate GGUF shard index ${index} for ${name}.`);
+    group.indices.add(index);
+    groups.set(name, group);
+  }
+  for (const [name, group] of groups) {
+    if (group.indices.size !== group.count) throw new Error(`Incomplete GGUF shard set ${name}: expected ${group.count}, found ${group.indices.size}.`);
+  }
+  return paths;
+}
+
+async function estimateGguf(
+  options: ModelOptions,
+  fetcher: FetchLike, paths: string[], headers: HeadersInit,
+): Promise<EstimateResult> {
   const parsed = await mapLimit(paths, options.concurrency, async (path) => {
     const metadata = await fetchGgufMetadata(fetcher, resolveUrl(options.hubUrl, options.modelId, options.revision, path), headers);
     const shard = path.match(SHARD);
     const group = shard ? `${shard[1]}.gguf` : path;
-    const shouldComputeKv = Boolean(options.kvCache && (!shard || shard[2] === "1"));
+    const shouldComputeKv = Boolean(options.kvCache && (!shard || Number(shard[2]) === 1));
     const kv = shouldComputeKv ? estimateGgufKvCache(metadata.metadata, {
       batchSize: options.batchSize,
       ...(options.maxModelLen !== undefined ? { maxModelLen: options.maxModelLen } : {}),
@@ -174,7 +214,7 @@ async function estimateGguf(
   const weights = Object.fromEntries(names.map((name) => [name, grouped[name]!.bytes]));
   const caches = Object.fromEntries(names.filter((name) => grouped[name]!.kvCache).map((name) => [name, grouped[name]!.kvCache!.bytes]));
   return {
-    modelId: options.modelId, revision: options.revision, format: "gguf", filename: options.ggufFile ? names[0]! : null,
+    modelId: options.modelId, revision: options.requestedRevision, resolvedRevision: options.revision, format: "gguf", filename: options.ggufFile ? names[0]! : null,
     weightsBytes: selected ? selected.bytes : weights,
     kvCacheBytes: selected ? selected.kvCache?.bytes ?? null : Object.keys(caches).length ? caches : null,
     totalBytes: selected ? selected.bytes + (selected.kvCache?.bytes ?? 0) : null, files: grouped,
@@ -184,7 +224,7 @@ async function estimateGguf(
 
 function selectMmproj(files: string[], requested: string | false | undefined): string | null {
   if (requested === false) return null;
-  const candidates = files.filter((path) => /(?:^|\/)mmproj[^/]*\.gguf$/i.test(path));
+  const candidates = files.filter(isMmproj);
   if (typeof requested === "string") {
     const matches = candidates.filter((path) => path === requested || path.endsWith(`/${requested}`));
     if (!matches.length) throw new Error(`No mmproj GGUF file matching ${requested} was found.`);
@@ -200,14 +240,15 @@ function selectMmproj(files: string[], requested: string | false | undefined): s
 
 async function estimateMmproj(
   path: string,
-  options: Required<Pick<EstimateOptions, "modelId" | "revision" | "hubUrl">>,
+  options: ModelOptions,
   fetcher: FetchLike,
   headers: HeadersInit,
 ): Promise<MmprojEstimate> {
   const metadata = await fetchGgufMetadata(fetcher, resolveUrl(options.hubUrl, options.modelId, options.revision, path), headers);
   return {
     modelId: options.modelId,
-    revision: options.revision,
+    revision: options.requestedRevision,
+    resolvedRevision: options.revision,
     filename: path,
     parameters: metadata.parameters,
     bytes: metadata.bytes,
@@ -255,9 +296,13 @@ function withAccessories(base: EstimateResult, mmproj: MmprojEstimate | null, dr
 }
 
 export async function estimateModelMemory(input: EstimateOptions): Promise<EstimateResult> {
-  if (!input.modelId?.includes("/")) throw new Error("modelId must be a Hugging Face repository ID such as owner/model.");
   const fetcher = input.fetch ?? globalThis.fetch;
   if (!fetcher) throw new Error("No global fetch implementation is available; pass options.fetch.");
+  return estimateModel(input, fetcher, requestPolicy(input));
+}
+
+async function estimateModel(input: EstimateOptions, rawFetch: FetchLike, policy: RequestPolicy): Promise<EstimateResult> {
+  if (!input.modelId?.includes("/")) throw new Error("modelId must be a Hugging Face repository ID such as owner/model.");
   const options = {
     revision: "main", batchSize: 1, concurrency: 8, hubUrl: "https://huggingface.co", kvCacheDtype: "auto", ...input,
   };
@@ -265,23 +310,33 @@ export async function estimateModelMemory(input: EstimateOptions): Promise<Estim
   assertPositiveInteger(options.batchSize, "batchSize");
   assertPositiveInteger(options.concurrency, "concurrency");
   if (options.maxModelLen !== undefined) assertPositiveInteger(options.maxModelLen, "maxModelLen");
+  const fetcher = transportFetch(rawFetch, options.concurrency, policy);
   const headers = requestHeaders(options.token);
   const targetPromise = (async () => {
-    const files = await listFiles(fetcher, options.hubUrl, options.modelId, options.revision, headers);
+    const info = await fetchJson<{ sha?: string }>(
+      fetcher, `${options.hubUrl}/api/models/${urlPath(options.modelId)}/revision/${encodeURIComponent(options.revision)}`, headers,
+    );
+    if (typeof info.sha !== "string" || !/^[a-f0-9]{40}$/i.test(info.sha)) {
+      throw new Error("Hub revision lookup did not return a valid immutable commit.");
+    }
+    const pinned = { ...options, revision: info.sha, requestedRevision: options.revision };
+    const files = await listFiles(fetcher, options.hubUrl, options.modelId, pinned.revision, headers);
     const hasSafetensors = files.some((path) => /(?:^|\/)(?:model|diffusion_pytorch_model)\.safetensors(?:\.index\.json)?$/.test(path)) || files.includes("model_index.json");
     const useGguf = Boolean(input.ggufFile || !hasSafetensors);
-    const basePromise = useGguf
-      ? estimateGguf(options, fetcher, files, headers)
-      : estimateSafetensors(options, fetcher, files, headers);
+    // Validate every selection before starting metadata work that can reject.
     const mmprojPath = useGguf ? selectMmproj(files, input.mmprojFile) : null;
-    const mmprojPromise = mmprojPath ? estimateMmproj(mmprojPath, options, fetcher, headers) : Promise.resolve(null);
+    const paths = useGguf ? ggufPaths(files, input.ggufFile) : [];
+    const basePromise = useGguf
+      ? estimateGguf(pinned, fetcher, paths, headers)
+      : estimateSafetensors(pinned, fetcher, files, headers);
+    const mmprojPromise = mmprojPath ? estimateMmproj(mmprojPath, pinned, fetcher, headers) : Promise.resolve(null);
     const [base, mmproj] = await Promise.all([basePromise, mmprojPromise]);
     return { base, mmproj };
   })();
   const draftPromise = draftMatchesTarget(input, options)
     ? targetPromise.then(({ base }) => base)
     : input.draftModel
-      ? estimateModelMemory(draftOptions(input, input.draftModel))
+      ? estimateModel(draftOptions(input, input.draftModel), rawFetch, policy)
       : Promise.resolve(null);
   const [{ base, mmproj }, draft] = await Promise.all([targetPromise, draftPromise]);
   return withAccessories(base, mmproj, draft);

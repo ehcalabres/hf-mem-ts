@@ -32,6 +32,7 @@ export function formatResult(result: EstimateResult): string {
   const info: Array<[string, string]> = [
     ["Model ID", result.modelId],
     ["Revision", result.revision],
+    ["Resolved revision", result.resolvedRevision],
     ["Format", result.format],
   ];
   if (result.filename) info.push(["File", result.filename]);
