@@ -153,7 +153,7 @@ export function transportFetch(fetcher: FetchLike, concurrency: number, policy: 
           close();
           void reader.cancel(reason).catch(() => {});
         },
-      });
+      }, { highWaterMark: 0 });
       return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
     } catch (error) {
       finish();

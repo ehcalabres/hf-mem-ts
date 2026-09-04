@@ -166,3 +166,15 @@ test("target and draft retain the caller's retry policy without recursive wrappi
     "https://huggingface.co/api/models/org/target/revision/main",
   ]);
 });
+
+test("preserves backpressure so callers can reject headers without reading payload", async () => {
+  let pulls = 0;
+  let cancelled = false;
+  const response = await transport(async () => new Response(new ReadableStream({
+    pull(controller) { pulls++; controller.enqueue(new Uint8Array([1])); controller.close(); },
+    cancel() { cancelled = true; },
+  }, { highWaterMark: 0 })))("https://example.com");
+  await response.body.cancel();
+  assert.equal(pulls, 0);
+  assert.equal(cancelled, true);
+});
