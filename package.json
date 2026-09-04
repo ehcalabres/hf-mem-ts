@@ -1,0 +1,60 @@
+{
+  "name": "hf-mem-ts",
+  "version": "0.1.0",
+  "description": "Estimate Hugging Face model inference memory from Safetensors and GGUF metadata",
+  "type": "module",
+  "sideEffects": false,
+  "bin": {
+    "hf-mem-ts": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./safetensors": {
+      "types": "./dist/safetensors.d.ts",
+      "import": "./dist/safetensors.js",
+      "default": "./dist/safetensors.js"
+    },
+    "./gguf": {
+      "types": "./dist/gguf.d.ts",
+      "import": "./dist/gguf.js",
+      "default": "./dist/gguf.js"
+    },
+    "./kv-cache": {
+      "types": "./dist/kv-cache.d.ts",
+      "import": "./dist/kv-cache.js",
+      "default": "./dist/kv-cache.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "test": "npm run build && node --test test/*.test.js",
+    "prepack": "npm test"
+  },
+  "keywords": [
+    "huggingface",
+    "safetensors",
+    "gguf",
+    "llm",
+    "memory"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
