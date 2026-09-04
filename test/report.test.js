@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { formatResult } from "../dist/report.js";
+import { estimateGgufKvCache } from "../dist/index.js";
 
 test("shows Diffusers components as model sub-rows", () => {
   const result = {
@@ -68,9 +69,10 @@ test("shows cache assumptions and preserves separate accessory costs", () => {
   const output = formatResult({
     modelId: "org/target", revision: "main", format: "gguf", filename: "model.gguf",
     weightsBytes: 2 ** 30, kvCacheBytes: 0.5 * 2 ** 30, totalBytes: 3.75 * 2 ** 30,
-    files: { "model.gguf": { components: {}, kvCache: {
-      bytes: 0.5 * 2 ** 30, dtype: "F16", maxModelLen: 4096, batchSize: 2,
-    } } },
+    files: { "model.gguf": { components: {}, kvCache: estimateGgufKvCache({
+      "llama.block_count": 16, "llama.attention.head_count_kv": 8,
+      "llama.attention.head_count": 32, "llama.embedding_length": 4096, "llama.context_length": 4096,
+    }, { batchSize: 2 }) } },
     mmproj: { filename: "mmproj.gguf", bytes: 0.25 * 2 ** 30 },
     draft: {
       modelId: "org/draft", revision: "main", format: "safetensors", filename: null,
