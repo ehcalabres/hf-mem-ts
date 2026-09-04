@@ -62,6 +62,29 @@ export function formatResult(result: EstimateResult): string {
   }
   memory.push(["Total", result.totalBytes === null ? "n/a (select a GGUF file)" : gib(result.totalBytes)]);
 
+  const cacheDetails: string[] = [];
+  for (const [label, model] of [["Target", result], ["Draft", result.draft]] as const) {
+    if (!model) continue;
+    for (const [filename, file] of Object.entries(model.files)) {
+      const cache = file.kvCache;
+      if (!cache) continue;
+      cacheDetails.push(
+        `${label} ${filename}: ${cache.layout}, ${cache.dtype} attention, ${cache.slidingWindowPolicy} allocation`,
+        `  Context: ${cache.maxModelLen} tokens; batch: ${cache.batchSize}`,
+        `  Layers: ${cache.fullAttentionLayers} full attention, ${cache.slidingAttentionLayers} sliding attention, ${cache.recurrentLayers} recurrent`,
+        `  Attention payload: ${gib(cache.attentionBytes)} (${cache.attentionBytes} bytes)`,
+        `  Persistent state: ${gib(cache.stateBytes)} (${cache.stateBytes} bytes)`,
+      );
+      if (cache.recurrentLayers) {
+        cacheDetails.push(
+          `  Convolution state: ${cache.convolutionBytes} bytes (${cache.convolutionDtype})`,
+          `  Recurrent state: ${cache.recurrentBytes} bytes (${cache.recurrentDtype})`,
+        );
+      }
+      cacheDetails.push(...cache.assumptions.map((assumption) => `  - ${assumption}`));
+    }
+  }
+
   return [
     "Model info",
     "----------",
@@ -70,5 +93,6 @@ export function formatResult(result: EstimateResult): string {
     "Total memory requirements",
     "-------------------------",
     ...formatRows(memory),
+    ...(cacheDetails.length ? ["", "Cache assumptions", "-----------------", ...cacheDetails] : []),
   ].join("\n");
 }

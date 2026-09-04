@@ -111,9 +111,11 @@ async function estimateSafetensors(
     const config = await fetchJson<Record<string, unknown>>(fetcher, resolveUrl(options.hubUrl, options.modelId, options.revision, "config.json"), headers);
     kvCache = estimateSafetensorsKvCache(config, {
       batchSize: options.batchSize,
-      metadata,
       ...(options.maxModelLen !== undefined ? { maxModelLen: options.maxModelLen } : {}),
       ...(options.kvCacheDtype !== undefined ? { dtype: options.kvCacheDtype } : {}),
+      ...(options.slidingWindowPolicy !== undefined ? { slidingWindowPolicy: options.slidingWindowPolicy } : {}),
+      ...(options.mlaLayout !== undefined ? { mlaLayout: options.mlaLayout } : {}),
+      ...(options.recurrentStateDtype !== undefined ? { recurrentStateDtype: options.recurrentStateDtype } : {}),
     });
   }
   return {
@@ -164,6 +166,9 @@ async function estimateGguf(
       batchSize: options.batchSize,
       ...(options.maxModelLen !== undefined ? { maxModelLen: options.maxModelLen } : {}),
       ...(options.kvCacheDtype !== undefined ? { dtype: options.kvCacheDtype } : {}),
+      ...(options.slidingWindowPolicy !== undefined ? { slidingWindowPolicy: options.slidingWindowPolicy } : {}),
+      ...(options.mlaLayout !== undefined ? { mlaLayout: options.mlaLayout } : {}),
+      ...(options.recurrentStateDtype !== undefined ? { recurrentStateDtype: options.recurrentStateDtype } : {}),
     }) : null;
     return { group, estimate: emptyFile(metadata, kv) };
   });
@@ -229,6 +234,9 @@ function draftOptions(input: EstimateOptions, draft: string | DraftModelOptions)
     ...((selected.maxModelLen ?? input.maxModelLen) !== undefined ? { maxModelLen: selected.maxModelLen ?? input.maxModelLen } : {}),
     ...((selected.batchSize ?? input.batchSize) !== undefined ? { batchSize: selected.batchSize ?? input.batchSize } : {}),
     ...((selected.kvCacheDtype ?? input.kvCacheDtype) !== undefined ? { kvCacheDtype: selected.kvCacheDtype ?? input.kvCacheDtype } : {}),
+    ...((selected.slidingWindowPolicy ?? input.slidingWindowPolicy) !== undefined ? { slidingWindowPolicy: selected.slidingWindowPolicy ?? input.slidingWindowPolicy } : {}),
+    ...((selected.mlaLayout ?? input.mlaLayout) !== undefined ? { mlaLayout: selected.mlaLayout ?? input.mlaLayout } : {}),
+    ...((selected.recurrentStateDtype ?? input.recurrentStateDtype) !== undefined ? { recurrentStateDtype: selected.recurrentStateDtype ?? input.recurrentStateDtype } : {}),
     ...(selected.ggufFile !== undefined ? { ggufFile: selected.ggufFile } : {}),
   };
 }
@@ -244,7 +252,10 @@ function draftMatchesTarget(
     && draft.ggufFile === input.ggufFile
     && (draft.maxModelLen ?? options.maxModelLen) === options.maxModelLen
     && (draft.batchSize ?? options.batchSize) === options.batchSize
-    && (draft.kvCacheDtype ?? options.kvCacheDtype) === options.kvCacheDtype;
+    && (draft.kvCacheDtype ?? options.kvCacheDtype) === options.kvCacheDtype
+    && (draft.slidingWindowPolicy ?? options.slidingWindowPolicy) === options.slidingWindowPolicy
+    && (draft.mlaLayout ?? options.mlaLayout) === options.mlaLayout
+    && (draft.recurrentStateDtype ?? options.recurrentStateDtype) === options.recurrentStateDtype;
 }
 
 function withAccessories(base: EstimateResult, mmproj: MmprojEstimate | null, draft: EstimateResult | null): EstimateResult {
