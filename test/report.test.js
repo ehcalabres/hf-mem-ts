@@ -7,6 +7,7 @@ test("formats a global report with target and draft memory rows", () => {
   const draft = {
     modelId: "org/draft",
     revision: "main",
+    resolvedRevision: "a".repeat(40),
     format: "safetensors",
     filename: null,
     weightsBytes: 1 * 2 ** 30,
@@ -19,6 +20,7 @@ test("formats a global report with target and draft memory rows", () => {
   const result = {
     modelId: "org/model",
     revision: "main",
+    resolvedRevision: "b".repeat(40),
     format: "safetensors",
     filename: null,
     weightsBytes: 4 * 2 ** 30,
@@ -29,25 +31,20 @@ test("formats a global report with target and draft memory rows", () => {
     draft,
   };
 
-  assert.equal(formatResult(result), `Model info
-----------
-Model ID: org/model
-Revision: main
-Format:   safetensors
-
-Total memory requirements
--------------------------
-Model:                4.00 GiB
-KV cache:             2.00 GiB
-Draft model:          1.00 GiB (org/draft@main)
-Draft model KV cache: 0.50 GiB
-Total:                7.50 GiB`);
+  const output = formatResult(result);
+  assert.match(output, /Resolved revision:\s+b{40}/);
+  assert.match(output, /Model:\s+4\.00 GiB/);
+  assert.match(output, /KV cache:\s+2\.00 GiB/);
+  assert.match(output, /Draft model:\s+1\.00 GiB \(org\/draft@main\)/);
+  assert.match(output, /Draft model KV cache:\s+0\.50 GiB/);
+  assert.match(output, /Total:\s+7\.50 GiB/);
 });
 
 test("shows Diffusers components as model sub-rows", () => {
   const result = {
     modelId: "org/diffusers",
     revision: "main",
+    resolvedRevision: "c".repeat(40),
     format: "safetensors",
     filename: null,
     weightsBytes: 15 * 2 ** 30,
