@@ -56,10 +56,13 @@ async function readBoundedBody(response: Response, limit: number, exact = false)
   return bytes;
 }
 
-export async function fetchJson<T>(fetcher: FetchLike, url: string, headers: HeadersInit): Promise<T> {
-  const response = await checkedFetch(fetcher, url, { headers });
+export async function readJson<T>(response: Response): Promise<T> {
   const bytes = await readBoundedBody(response, 32 * 1024 * 1024);
   return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as T;
+}
+
+export async function fetchJson<T>(fetcher: FetchLike, url: string, headers: HeadersInit): Promise<T> {
+  return readJson<T>(await checkedFetch(fetcher, url, { headers }));
 }
 
 export async function fetchRange(
