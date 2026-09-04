@@ -1,7 +1,7 @@
 import { fetchGgufMetadata, estimateGgufKvCache } from "./gguf.js";
 import { assertPositiveInteger, checkedFetch, fetchJson, mapLimit } from "./http.js";
 import { estimateSafetensorsKvCache } from "./kv-cache.js";
-import { fetchSafetensorsHeader, parseSafetensorsHeaders, type SafetensorsHeader } from "./safetensors.js";
+import { fetchSafetensorsHeader, parseSafetensorsHeaders } from "./safetensors.js";
 import type { DraftModelOptions, EstimateOptions, EstimateResult, FileEstimate, FetchLike, HubFile, MmprojEstimate, WeightMetadata } from "./types.js";
 
 const SHARD = /(.+)-(\d+)-of-(\d+)\.gguf$/i;
@@ -102,9 +102,24 @@ async function estimateSafetensors(
   const fetched = await mapLimit(paths, options.concurrency, async ({ path, component }) => ({
     component, header: await fetchSafetensorsHeader(fetcher, resolveUrl(options.hubUrl, options.modelId, options.revision, path), headers),
   }));
-  const grouped: Record<string, SafetensorsHeader> = {};
-  for (const { component, header } of fetched) grouped[component] = { ...(grouped[component] ?? {}), ...header };
-  const metadata = parseSafetensorsHeaders(grouped);
+  // Offsets are file-relative: validate each shard before combining its statistics.
+  const metadata: WeightMetadata = { parameters: 0, bytes: 0, components: Object.create(null) };
+  for (const { component, header } of fetched) {
+    const next = parseSafetensorsHeaders({ [component]: header });
+    const current = metadata.components[component] ?? { parameters: 0, bytes: 0, dtypes: Object.create(null) };
+    for (const [dtype, stats] of Object.entries(next.components[component]!.dtypes)) {
+      const old = current.dtypes[dtype] ?? { parameters: 0, bytes: 0 };
+      current.dtypes[dtype] = { parameters: old.parameters + stats.parameters, bytes: old.bytes + stats.bytes };
+    }
+    current.parameters += next.parameters;
+    current.bytes += next.bytes;
+    metadata.parameters += next.parameters;
+    metadata.bytes += next.bytes;
+    if (!Number.isSafeInteger(metadata.parameters) || !Number.isSafeInteger(metadata.bytes)) {
+      throw new RangeError("Safetensors totals exceed JavaScript's safe integer range.");
+    }
+    metadata.components[component] = current;
+  }
   let kvCache = null;
   if (options.kvCache) {
     if (!files.includes("config.json")) throw new Error("KV-cache estimation requested, but config.json was not found.");

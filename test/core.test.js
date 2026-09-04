@@ -18,6 +18,13 @@ function safetensorsFile(header) {
   return output;
 }
 
+function partial(file, start = 0, end = file.length - 1) {
+  end = Math.min(end, file.length - 1);
+  return new Response(file.slice(start, end + 1), {
+    status: 206, headers: { "Content-Range": `bytes ${start}-${end}/${file.length}` },
+  });
+}
+
 class BinaryWriter {
   chunks = [];
   raw(value) { this.chunks.push(Uint8Array.from(value)); }
@@ -53,10 +60,10 @@ test("fetches only the two Safetensors metadata ranges", async () => {
   const file = safetensorsFile({ weight: { dtype: "F16", shape: [2, 3], data_offsets: [0, 12] } });
   const ranges = [];
   const fetcher = async (_url, init) => {
-    const range = init.headers.Range;
+    const range = new Headers(init.headers).get("range");
     ranges.push(range);
     const [, start, end] = range.match(/bytes=(\d+)-(\d+)/).map(Number);
-    return new Response(file.slice(start, end + 1), { status: 206 });
+    return partial(file, start, end);
   };
   const header = await fetchSafetensorsHeader(fetcher, "https://example.test/model.safetensors");
   assert.equal(header.weight.dtype, "F16");
@@ -84,7 +91,7 @@ test("estimates a Hub Safetensors model through an injected fetch", async () => 
     if (url.endsWith("config.json")) return Response.json({ hidden_size: 8, num_hidden_layers: 2, num_attention_heads: 2, max_position_embeddings: 16, torch_dtype: "float16" });
     const range = new Headers(init.headers).get("range");
     const match = range.match(/bytes=(\d+)-(\d+)/);
-    return new Response(file.slice(Number(match[1]), Number(match[2]) + 1), { status: 206 });
+    return partial(file, Number(match[1]), Number(match[2]));
   };
   const result = await estimateModelMemory({ modelId: "org/model", fetch: fetcher, kvCache: true });
   assert.equal(result.format, "safetensors");
@@ -98,7 +105,7 @@ test("keeps embedded GGUF metadata internal to the parser", async () => {
   const fetcher = async (input, init = {}) => {
     if (String(input).includes("/tree/")) return Response.json([{ type: "file", path: "model-Q4_K.gguf" }]);
     assert.match(new Headers(init.headers).get("range"), /^bytes=0-/);
-    return new Response(file, { status: 206 });
+    return partial(file);
   };
   const result = await estimateModelMemory({ modelId: "org/gguf", ggufFile: "model-Q4_K.gguf", fetch: fetcher });
   assert.equal(result.weightsBytes, Math.floor(4096 ** 2 * 4.5 / 8));
@@ -118,7 +125,7 @@ test("adds an auto-selected F16 mmproj and a separate draft model to total memor
       { type: "file", path: "draft-Q4_K.gguf" },
       { type: "file", path: "mmproj-F16.gguf" },
     ]);
-    return new Response(file, { status: 206 });
+    return partial(file);
   };
   const result = await estimateModelMemory({
     modelId: "org/main",
@@ -146,7 +153,7 @@ test("estimates target and draft models concurrently", async () => {
     const url = String(input);
     if (url.includes("/tree/")) return Response.json([{ type: "file", path: "model.safetensors" }]);
     const match = new Headers(init.headers).get("range").match(/bytes=(\d+)-(\d+)/);
-    return new Response(file.slice(Number(match[1]), Number(match[2]) + 1), { status: 206 });
+    return partial(file, Number(match[1]), Number(match[2]));
   };
 
   const result = await estimateModelMemory({
@@ -178,7 +185,7 @@ test("fetches multiple Safetensors indexes concurrently", async () => {
       return Response.json({ weight_map: { weight: "weights.safetensors" } });
     }
     const match = new Headers(init.headers).get("range").match(/bytes=(\d+)-(\d+)/);
-    return new Response(file.slice(Number(match[1]), Number(match[2]) + 1), { status: 206 });
+    return partial(file, Number(match[1]), Number(match[2]));
   };
 
   const result = await estimateModelMemory({ modelId: "org/model", concurrency: 2, fetch: fetcher });
@@ -232,7 +239,7 @@ test("discovers mixed sharded and unsharded Diffusers components from model_inde
     assert.ok(path, `unexpected URL: ${url}`);
     const range = new Headers(init.headers).get("range");
     const match = range.match(/bytes=(\d+)-(\d+)/);
-    return new Response(binaries[path].slice(Number(match[1]), Number(match[2]) + 1), { status: 206 });
+    return partial(binaries[path], Number(match[1]), Number(match[2]));
   };
 
   const result = await estimateModelMemory({ modelId: "org/diffusers", fetch: fetcher });
@@ -254,7 +261,7 @@ test("reuses metadata when target and draft select the same model file", async (
       return Response.json([{ type: "file", path: "model-Q4_K.gguf" }]);
     }
     rangeRequests++;
-    return new Response(file, { status: 206 });
+    return partial(file);
   };
 
   const result = await estimateModelMemory({
