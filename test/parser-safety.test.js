@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { fetchGgufMetadata, fetchSafetensorsHeader, GGUF_DTYPE_BITS, parseGguf, parseSafetensorsHeaders } from "../dist/index.js";
+import { estimateModelMemory, fetchGgufMetadata, fetchSafetensorsHeader, GGUF_DTYPE_BITS, parseGguf, parseSafetensorsHeaders } from "../dist/index.js";
 import { fetchJson, fetchRange } from "../dist/http.js";
 
 class Writer {
@@ -227,4 +227,45 @@ test("HTTP rejects mismatched range body sizes and oversized JSON metadata", asy
   }, { highWaterMark: 0 }), { headers: { "Content-Length": "33554433" } }), "https://example.test/config", {}));
   assert.equal(cancelled, true);
   assert.equal(reads, 0);
+});
+
+test("Hub rejects oversized tree pages before consuming their bodies", async () => {
+  let cancelled = false;
+  let reads = 0;
+  await assert.rejects(estimateModelMemory({
+    modelId: "org/model",
+    fetch: async (input) => {
+      if (String(input).includes("/revision/")) return Response.json({ sha: "a".repeat(40) });
+      assert.ok(String(input).includes("/tree/"));
+      const body = new ReadableStream({
+        pull(controller) {
+          reads++;
+          controller.enqueue(new TextEncoder().encode("[]"));
+          controller.close();
+        },
+        cancel() { cancelled = true; },
+      }, { highWaterMark: 0 });
+      return new Response(body, { headers: { "Content-Length": "33554433" } });
+    },
+  }));
+  assert.equal(cancelled, true);
+  assert.equal(reads, 0);
+});
+
+test("Hub rejects unsafe shard and draft totals from individually safe GGUF headers", async () => {
+  const file = gguf([{ type: 24, shape: [2 ** 52] }]);
+  assert.equal(parseGguf(file).bytes, 4_503_599_627_370_496);
+  for (const sharded of [true, false]) {
+    const paths = sharded ? ["model-00001-of-00002.gguf", "model-00002-of-00002.gguf"] : ["model.gguf"];
+    await assert.rejects(estimateModelMemory({
+      modelId: "org/model",
+      ggufFile: paths[0],
+      ...(sharded ? {} : { draftModel: { modelId: "org/model", ggufFile: paths[0] } }),
+      fetch: async (input, init) => {
+        if (String(input).includes("/revision/")) return Response.json({ sha: "a".repeat(40) });
+        if (String(input).includes("/tree/")) return Response.json(paths.map((path) => ({ type: "file", path })));
+        return ranged(file, init);
+      },
+    }), RangeError);
+  }
 });
