@@ -1,7 +1,7 @@
 import { fetchGgufMetadata, estimateGgufKvCache } from "./gguf.js";
-import { assertPositiveInteger, checkedFetch, fetchJson, mapLimit } from "./http.js";
+import { assertPositiveInteger, checkedFetch, fetchJson, mapLimit, readJson } from "./http.js";
 import { estimateSafetensorsKvCache } from "./kv-cache.js";
-import { fetchSafetensorsHeader, parseSafetensorsHeaders, type SafetensorsHeader } from "./safetensors.js";
+import { fetchSafetensorsHeader, parseSafetensorsHeaders } from "./safetensors.js";
 import type { DraftModelOptions, EstimateOptions, EstimateResult, FileEstimate, FetchLike, HubFile, MmprojEstimate, WeightMetadata } from "./types.js";
 
 const SHARD = /(.+)-(\d+)-of-(\d+)\.gguf$/i;
@@ -17,7 +17,7 @@ async function listFiles(fetcher: FetchLike, hub: string, modelId: string, revis
   const paths: string[] = [];
   while (url) {
     const response = await checkedFetch(fetcher, url, { headers });
-    const files = await response.json() as HubFile[];
+    const files = await readJson<HubFile[]>(response);
     paths.push(...files.filter((file) => file.type === "file").map((file) => file.path));
     const link = response.headers.get("link");
     const next = link?.split(",").find((part) => /rel="?next"?/.test(part));
@@ -102,9 +102,24 @@ async function estimateSafetensors(
   const fetched = await mapLimit(paths, options.concurrency, async ({ path, component }) => ({
     component, header: await fetchSafetensorsHeader(fetcher, resolveUrl(options.hubUrl, options.modelId, options.revision, path), headers),
   }));
-  const grouped: Record<string, SafetensorsHeader> = {};
-  for (const { component, header } of fetched) grouped[component] = { ...(grouped[component] ?? {}), ...header };
-  const metadata = parseSafetensorsHeaders(grouped);
+  // Offsets are file-relative: validate each shard before combining its statistics.
+  const metadata: WeightMetadata = { parameters: 0, bytes: 0, components: Object.create(null) };
+  for (const { component, header } of fetched) {
+    const next = parseSafetensorsHeaders({ [component]: header });
+    const current = metadata.components[component] ?? { parameters: 0, bytes: 0, dtypes: Object.create(null) };
+    for (const [dtype, stats] of Object.entries(next.components[component]!.dtypes)) {
+      const old = current.dtypes[dtype] ?? { parameters: 0, bytes: 0 };
+      current.dtypes[dtype] = { parameters: old.parameters + stats.parameters, bytes: old.bytes + stats.bytes };
+    }
+    current.parameters += next.parameters;
+    current.bytes += next.bytes;
+    metadata.parameters += next.parameters;
+    metadata.bytes += next.bytes;
+    if (!Number.isSafeInteger(metadata.parameters) || !Number.isSafeInteger(metadata.bytes)) {
+      throw new RangeError("Safetensors totals exceed JavaScript's safe integer range.");
+    }
+    metadata.components[component] = current;
+  }
   let kvCache = null;
   if (options.kvCache) {
     if (!files.includes("config.json")) throw new Error("KV-cache estimation requested, but config.json was not found.");
@@ -126,6 +141,11 @@ async function estimateSafetensors(
 
 function mergeMetadata(target: FileEstimate | undefined, next: FileEstimate): FileEstimate {
   if (!target) return next;
+  const parameters = target.parameters + next.parameters;
+  const bytes = target.bytes + next.bytes;
+  if (!Number.isSafeInteger(parameters) || !Number.isSafeInteger(bytes)) {
+    throw new RangeError("Combined model metadata exceeds JavaScript's safe integer range.");
+  }
   const components = { ...target.components };
   for (const [name, component] of Object.entries(next.components)) {
     const current = components[name] ?? { parameters: 0, bytes: 0, dtypes: {} };
@@ -135,7 +155,7 @@ function mergeMetadata(target: FileEstimate | undefined, next: FileEstimate): Fi
     }
     current.parameters += component.parameters; current.bytes += component.bytes; components[name] = current;
   }
-  return { parameters: target.parameters + next.parameters, bytes: target.bytes + next.bytes, components, kvCache: target.kvCache ?? next.kvCache };
+  return { parameters, bytes, components, kvCache: target.kvCache ?? next.kvCache };
 }
 
 async function estimateGguf(
@@ -251,6 +271,9 @@ function withAccessories(base: EstimateResult, mmproj: MmprojEstimate | null, dr
   const totalBytes = base.totalBytes === null || draft?.totalBytes === null
     ? null
     : base.totalBytes + (mmproj?.bytes ?? 0) + (draft?.totalBytes ?? 0);
+  if (totalBytes !== null && !Number.isSafeInteger(totalBytes)) {
+    throw new RangeError("Total model memory exceeds JavaScript's safe integer range.");
+  }
   return { ...base, totalBytes, mmproj, draft };
 }
 
