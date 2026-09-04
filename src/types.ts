@@ -1,25 +1,53 @@
 export interface DtypeStats {
+  /** Stored tensor elements, not necessarily logical model parameters for packed weights. */
   parameters: number;
   bytes: number;
 }
 
 export interface ComponentStats {
+  /** Stored tensor elements, not necessarily logical model parameters for packed weights. */
   parameters: number;
   bytes: number;
   dtypes: Record<string, DtypeStats>;
 }
 
 export interface WeightMetadata {
+  /** Stored tensor elements, not necessarily logical model parameters for packed weights. */
   parameters: number;
   bytes: number;
   components: Record<string, ComponentStats>;
 }
 
 export interface KvCacheEstimate {
+  /** Attention cache plus persistent convolution/recurrent state; excludes working memory. */
   bytes: number;
   dtype: string;
   maxModelLen: number;
   batchSize: number;
+  attentionBytes: number;
+  stateBytes: number;
+  convolutionBytes: number;
+  recurrentBytes: number;
+  convolutionDtype: string | null;
+  recurrentDtype: string | null;
+  layout: "attention" | "mla-compressed" | "mla-expanded" | "qwen3.5-hybrid";
+  slidingWindowPolicy: "optimized" | "full-context";
+  fullAttentionLayers: number;
+  slidingAttentionLayers: number;
+  recurrentLayers: number;
+  assumptions: string[];
+}
+
+export interface KvCacheOptions {
+  maxModelLen?: number;
+  batchSize?: number;
+  dtype?: string;
+  /** Backend allocation policy, not the attention mask. Defaults to optimized. */
+  slidingWindowPolicy?: "optimized" | "full-context";
+  /** MLA storage choice. Defaults to compressed (latent plus shared RoPE key). */
+  mlaLayout?: "compressed" | "expanded";
+  /** Qwen3.5 recurrent storage precision; config mamba_ssm_dtype or F32 if omitted. */
+  recurrentStateDtype?: string;
 }
 
 export interface FileEstimate extends WeightMetadata {
@@ -62,6 +90,9 @@ export interface DraftModelOptions {
   maxModelLen?: number;
   batchSize?: number;
   kvCacheDtype?: string;
+  slidingWindowPolicy?: "optimized" | "full-context";
+  mlaLayout?: "compressed" | "expanded";
+  recurrentStateDtype?: string;
 }
 
 export interface EstimateOptions {
@@ -83,6 +114,12 @@ export interface EstimateOptions {
   batchSize?: number;
   /** Safetensors aliases (auto, bfloat16, fp8...) or a GGUF dtype (F16, Q8_0...). */
   kvCacheDtype?: string;
+  /** Allocate window-limited attention caches or full context per attention layer. */
+  slidingWindowPolicy?: "optimized" | "full-context";
+  /** MLA backend storage layout; defaults to compressed, not universal across engines. */
+  mlaLayout?: "compressed" | "expanded";
+  /** Override Qwen3.5 recurrent state storage dtype to match the backend. */
+  recurrentStateDtype?: string;
   /** Override fetch, useful for SSR, tests, proxies, or non-browser runtimes. */
   fetch?: FetchLike;
   /** Cancel target and draft requests, body reads, queued work, and retry delays. */

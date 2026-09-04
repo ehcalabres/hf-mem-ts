@@ -73,7 +73,11 @@ test("fetches only the two Safetensors metadata ranges", async () => {
 test("computes GQA KV cache and parses GGUF tensor metadata", () => {
   const config = { hidden_size: 4096, num_hidden_layers: 32, num_attention_heads: 32, num_key_value_heads: 8, max_position_embeddings: 4096, torch_dtype: "bfloat16" };
   const cache = estimateSafetensorsKvCache(config);
-  assert.deepEqual(cache, { bytes: 536_870_912, dtype: "BF16", maxModelLen: 4096, batchSize: 1 });
+  assert.equal(cache.bytes, 536_870_912);
+  assert.equal(cache.attentionBytes, 536_870_912);
+  assert.equal(cache.stateBytes, 0);
+  assert.equal(cache.dtype, "BF16");
+  assert.equal(cache.layout, "attention");
 
   const parsed = parseGguf(ggufFile());
   assert.equal(parsed.parameters, 4096 ** 2);

@@ -27,6 +27,9 @@ Options:
       --batch-size <n>      Batch size (default: 1)
       --concurrency <n>     Parallel metadata requests per model (default: 8)
       --kv-cache-dtype <d>  KV dtype (default: auto; GGUF auto is F16)
+      --sliding-window-policy <p> optimized (default) or full-context allocation
+      --mla-layout <layout> compressed (default) or expanded MLA cache
+      --recurrent-state-dtype <d> Qwen3.5 recurrent storage precision override
       --token <token>       Hugging Face token (or use HF_TOKEN)
       --json                Print machine-readable JSON
   -h, --help                Show help
@@ -46,6 +49,9 @@ interface Args {
   batchSize?: number;
   concurrency?: number;
   kvCacheDtype?: string;
+  slidingWindowPolicy?: "optimized" | "full-context";
+  mlaLayout?: "compressed" | "expanded";
+  recurrentStateDtype?: string;
   token?: string;
   json?: boolean;
   help?: boolean;
@@ -81,6 +87,19 @@ function parseArgs(argv: string[]): Args {
       case "--batch-size": args.batchSize = parseInteger(take(i++, value), value); break;
       case "--concurrency": args.concurrency = parseInteger(take(i++, value), value); break;
       case "--kv-cache-dtype": args.kvCacheDtype = take(i++, value); break;
+      case "--sliding-window-policy": {
+        const policy = take(i++, value);
+        if (policy !== "optimized" && policy !== "full-context") throw new Error("--sliding-window-policy requires optimized or full-context.");
+        args.slidingWindowPolicy = policy;
+        break;
+      }
+      case "--mla-layout": {
+        const layout = take(i++, value);
+        if (layout !== "compressed" && layout !== "expanded") throw new Error("--mla-layout requires compressed or expanded.");
+        args.mlaLayout = layout;
+        break;
+      }
+      case "--recurrent-state-dtype": args.recurrentStateDtype = take(i++, value); break;
       case "--token": args.token = take(i++, value); break;
       case "--json": args.json = true; break;
       case "-h": case "--help": args.help = true; break;
@@ -116,6 +135,9 @@ async function main(): Promise<void> {
     ...(args.batchSize ? { batchSize: args.batchSize } : {}),
     ...(args.concurrency ? { concurrency: args.concurrency } : {}),
     ...(args.kvCacheDtype ? { kvCacheDtype: args.kvCacheDtype } : {}),
+    ...(args.slidingWindowPolicy ? { slidingWindowPolicy: args.slidingWindowPolicy } : {}),
+    ...(args.mlaLayout ? { mlaLayout: args.mlaLayout } : {}),
+    ...(args.recurrentStateDtype ? { recurrentStateDtype: args.recurrentStateDtype } : {}),
     ...(token ? { token } : {}),
   });
   if (args.json) console.log(JSON.stringify(result, null, 2));

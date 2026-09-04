@@ -83,6 +83,29 @@ export function formatResult(result: EstimateResult): string {
   const missing = selections.length ? `select ${selections.join(" and ")}` : "incomplete estimate";
   memory.push(["Total", result.totalBytes === null ? `n/a (${missing})` : gib(result.totalBytes)]);
 
+  const cacheDetails: string[] = [];
+  for (const [label, model] of [["Target", result], ["Draft", result.draft]] as const) {
+    if (!model) continue;
+    for (const [filename, file] of Object.entries(model.files)) {
+      const cache = file.kvCache;
+      if (!cache) continue;
+      cacheDetails.push(
+        `${label} ${filename}: ${cache.layout}, ${cache.dtype} attention, ${cache.slidingWindowPolicy} allocation`,
+        `  Context: ${cache.maxModelLen} tokens; batch: ${cache.batchSize}`,
+        `  Layers: ${cache.fullAttentionLayers} full attention, ${cache.slidingAttentionLayers} sliding attention, ${cache.recurrentLayers} recurrent`,
+        `  Attention payload: ${gib(cache.attentionBytes)} (${cache.attentionBytes} bytes)`,
+        `  Persistent state: ${gib(cache.stateBytes)} (${cache.stateBytes} bytes)`,
+      );
+      if (cache.recurrentLayers) {
+        cacheDetails.push(
+          `  Convolution state: ${cache.convolutionBytes} bytes (${cache.convolutionDtype})`,
+          `  Recurrent state: ${cache.recurrentBytes} bytes (${cache.recurrentDtype})`,
+        );
+      }
+      cacheDetails.push(...cache.assumptions.map((assumption) => `  - ${assumption}`));
+    }
+  }
+
   return [
     "Model info",
     "----------",
@@ -97,5 +120,6 @@ export function formatResult(result: EstimateResult): string {
     "Excludes activations, temporary workspaces, allocator/framework overhead, and runtime weight conversion.",
     "Assumes the counted weights are resident; offloading and distributed replication are not modeled.",
     "Not a peak RAM/VRAM measurement or a guarantee that inference will fit.",
+    ...(cacheDetails.length ? ["", "Cache assumptions", "-----------------", ...cacheDetails] : []),
   ].join("\n");
 }

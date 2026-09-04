@@ -159,28 +159,102 @@ export async function fetchGgufMetadata(fetcher: FetchLike, url: string, headers
   }
 }
 
-const KV_SUFFIXES = ["block_count", "head_count_kv", "head_count", "embedding_length", "context_length"] as const;
+import type { KvCacheOptions } from "./types.js";
 
 export function estimateGgufKvCache(
   metadata: Record<string, unknown>,
-  options: { maxModelLen?: number; batchSize?: number; dtype?: string } = {},
+  options: KvCacheOptions = {},
 ): KvCacheEstimate {
-  const values: Record<string, number> = {};
-  for (const suffix of KV_SUFFIXES) {
-    const entry = Object.entries(metadata).find(([key]) => key.endsWith(suffix));
-    if (entry && Number.isSafeInteger(entry[1]) && (entry[1] as number) > 0) values[suffix] = entry[1] as number;
+  const positive = (value: unknown, name: string): number => {
+    if (!Number.isSafeInteger(value) || (value as number) <= 0) throw new RangeError(`${name} must be a positive safe integer.`);
+    return value as number;
+  };
+  const product = (...values: number[]): number => {
+    let result = 1;
+    for (const value of values) {
+      result *= value;
+      if (!Number.isSafeInteger(result)) throw new RangeError("Cache estimate exceeds JavaScript's safe integer range.");
+    }
+    return result;
+  };
+  let architecture = metadata["general.architecture"];
+  if (architecture === undefined) {
+    // Older/minimal metadata is usable only when the architecture namespace is unambiguous.
+    const namespaces = Object.keys(metadata).filter((key) => /^[^.]+\.block_count$/.test(key)).map((key) => key.split(".")[0]!);
+    if (namespaces.length !== 1) throw new Error("GGUF cache estimation requires general.architecture or one unambiguous block_count namespace.");
+    architecture = namespaces[0];
   }
-  if (options.maxModelLen !== undefined) values.context_length = options.maxModelLen;
-  const missing = KV_SUFFIXES.filter((key) => !values[key]);
-  if (missing.length) throw new Error(`GGUF metadata lacks KV-cache fields: ${missing.join(", ")}.`);
+  if (typeof architecture !== "string" || !architecture) throw new Error("GGUF general.architecture must be a nonempty string.");
+  // These are conventional MHA/GQA layouts. Do not guess for recurrent, MLA, or hybrid architectures.
+  if (!["llama", "qwen2", "qwen2moe", "qwen3", "qwen3moe", "gemma", "gemma2", "gemma3", "mistral", "phi2", "phi3", "starcoder2", "gpt2", "gptneox", "falcon"].includes(architecture)) {
+    throw new Error(`Unsupported GGUF cache layout: ${architecture}. Disable kvCache; use a supported Safetensors config for MLA or Qwen3.5 recurrent accounting.`);
+  }
+  const field = (suffix: string): unknown => metadata[`${architecture}.${suffix}`];
+  if (field("attention.causal") === false) throw new Error("Unsupported GGUF cache layout: non-causal attention does not use a conventional autoregressive KV cache.");
+  for (const key of Object.keys(metadata)) {
+    if (key.startsWith(`${architecture}.`) && /ssm\.|recurrent|lora_rank|kv_shared|shared_kv|cross_attention/.test(key)) {
+      throw new Error(`Unsupported GGUF cache layout field ${key}; model-specific state/sharing cannot use the conventional attention formula.`);
+    }
+  }
+  const layers = positive(field("block_count"), "block_count");
+  const heads = positive(field("attention.head_count"), "head_count");
+  const kvHeads = field("attention.head_count_kv") === undefined ? heads : positive(field("attention.head_count_kv"), "head_count_kv");
+  if (heads % kvHeads !== 0) throw new RangeError("head_count must be divisible by head_count_kv.");
+  const maxModelLen = positive(options.maxModelLen ?? field("context_length"), "maxModelLen");
+  const batchSize = positive(options.batchSize ?? 1, "batchSize");
+  let defaultHeadDim: number | undefined;
+  if (field("attention.key_length") === undefined || field("attention.value_length") === undefined) {
+    defaultHeadDim = positive(positive(field("embedding_length"), "embedding_length") / heads, "embedding_length / head_count");
+  }
+  const keyDim = positive(field("attention.key_length") ?? defaultHeadDim, "attention.key_length");
+  const valueDim = positive(field("attention.value_length") ?? defaultHeadDim, "attention.value_length");
   const dtype = (options.dtype ?? "F16").toUpperCase() === "AUTO" ? "F16" : (options.dtype ?? "F16").toUpperCase();
-  const bits = GGUF_DTYPE_BITS[dtype];
-  if (bits === undefined) throw new Error(`Unsupported GGUF KV-cache dtype: ${dtype}.`);
-  const batchSize = options.batchSize ?? 1;
-  if (!Number.isSafeInteger(batchSize) || batchSize <= 0) throw new RangeError("batchSize must be a positive safe integer.");
-  const maxModelLen = values.context_length!;
-  const headDim = Math.floor(values.embedding_length! / values.head_count!);
-  const bytes = Math.floor(values.block_count! * 2 * values.head_count_kv! * headDim * maxModelLen * batchSize * bits / 8);
-  if (!Number.isSafeInteger(bytes)) throw new RangeError("KV-cache estimate exceeds JavaScript's safe integer range.");
-  return { bytes, dtype, maxModelLen, batchSize };
+  const rawBytes: Record<string, number> = { F16: 2, BF16: 2, F32: 4 };
+  // GGML cache block encodings, including their per-block scales/minima.
+  const blockBytes: Record<string, number> = { Q8_0: 34, Q4_0: 18, Q4_1: 20, Q5_0: 22, Q5_1: 24 };
+  let keyRowBytes: number;
+  let valueRowBytes: number;
+  if (rawBytes[dtype] !== undefined) {
+    keyRowBytes = product(keyDim, rawBytes[dtype]!);
+    valueRowBytes = product(valueDim, rawBytes[dtype]!);
+  } else if (blockBytes[dtype] !== undefined) {
+    if (keyDim % 32 || valueDim % 32) throw new Error(`GGUF ${dtype} cache head dimensions must be multiples of 32; backend-specific quantized padding is not modeled.`);
+    keyRowBytes = product(keyDim / 32, blockBytes[dtype]!);
+    valueRowBytes = product(valueDim / 32, blockBytes[dtype]!);
+  } else {
+    throw new Error(`Unsupported GGUF KV-cache dtype: ${dtype}; use F16, BF16, F32, Q8_0, Q4_0, Q4_1, Q5_0 or Q5_1.`);
+  }
+  const slidingWindowPolicy = options.slidingWindowPolicy ?? "optimized";
+  if (!["optimized", "full-context"].includes(slidingWindowPolicy)) throw new Error("slidingWindowPolicy must be optimized or full-context.");
+  if (options.mlaLayout !== undefined) throw new Error("mlaLayout is only supported for Safetensors MLA configurations.");
+  let fullAttentionLayers = layers;
+  let slidingAttentionLayers = 0;
+  const slidingWindow = field("attention.sliding_window");
+  if (slidingWindow === undefined && field("attention.sliding_window_pattern") !== undefined) {
+    throw new Error("Unsupported GGUF sliding-window schedule: sliding_window_pattern is present without sliding_window.");
+  }
+  if (slidingWindow !== undefined) {
+    positive(slidingWindow, "attention.sliding_window");
+    // GGUF does not uniformly encode per-layer window schedules; refusing is safer than guessing.
+    if (!["llama", "mistral"].includes(architecture) || field("attention.sliding_window_pattern") !== undefined) {
+      throw new Error(`Unsupported GGUF hybrid sliding-window schedule for ${architecture}; use a Safetensors config with explicit layer_types.`);
+    }
+    fullAttentionLayers = 0;
+    slidingAttentionLayers = layers;
+  } else if (["gemma2", "gemma3"].includes(architecture)) {
+    throw new Error(`Unsupported GGUF cache layout: ${architecture} requires a per-layer sliding-window schedule.`);
+  }
+  const tokens = slidingAttentionLayers && slidingWindowPolicy === "optimized" ? Math.min(maxModelLen, slidingWindow as number) : maxModelLen;
+  const rowBytes = keyRowBytes + valueRowBytes;
+  if (!Number.isSafeInteger(rowBytes)) throw new RangeError("Cache estimate exceeds JavaScript's safe integer range.");
+  const bytes = product(layers, kvHeads, rowBytes, tokens, batchSize);
+  return {
+    bytes, dtype, maxModelLen, batchSize, attentionBytes: bytes, stateBytes: 0, convolutionBytes: 0, recurrentBytes: 0,
+    convolutionDtype: null, recurrentDtype: null,
+    layout: "attention", slidingWindowPolicy, fullAttentionLayers, slidingAttentionLayers, recurrentLayers: 0,
+    assumptions: [
+      `GGUF ${architecture} attention stores separate keys (${keyDim} elements/head) and values (${valueDim} elements/head); auto cache precision is F16, independent of weight quantization.`,
+      `Sliding-window allocation policy: ${slidingWindowPolicy}. Resident payload only; excludes backend padding, paging, workspaces, offloading and cache sharing.`,
+    ],
+  };
 }
