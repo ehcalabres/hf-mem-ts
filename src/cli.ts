@@ -7,7 +7,7 @@ const VERSION = "0.1.0";
 function usage(): string {
   return `hf-mem-ts ${VERSION}
 
-Estimate model weights and optional KV-cache memory without downloading weights.
+Estimate resident model weights and optional cache from remote file metadata.
 
 Usage:
   hf-mem-ts <owner/model> [options]
