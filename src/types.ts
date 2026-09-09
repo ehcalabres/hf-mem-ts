@@ -29,12 +29,16 @@ export interface FileEstimate extends WeightMetadata {
 export interface MmprojEstimate extends WeightMetadata {
   modelId: string;
   revision: string;
+  /** Immutable Hub commit used for every file request. */
+  resolvedRevision: string;
   filename: string;
 }
 
 export interface EstimateResult {
   modelId: string;
   revision: string;
+  /** Immutable Hub commit; revision retains the requested branch, tag, or commit. */
+  resolvedRevision: string;
   format: "safetensors" | "gguf";
   /** Set when a single GGUF (or one sharded GGUF set) was requested. */
   filename: string | null;
@@ -81,7 +85,12 @@ export interface EstimateOptions {
   kvCacheDtype?: string;
   /** Override fetch, useful for SSR, tests, proxies, or non-browser runtimes. */
   fetch?: FetchLike;
-  /** Maximum simultaneous metadata requests. Defaults to 8. */
+  /** Cancel target and draft requests, body reads, queued work, and retry delays. */
+  signal?: AbortSignal;
+  /** Per-request deadline including retries and body consumption; defaults to 30,000 ms. */
+  requestTimeoutMs?: number;
+  /** Retries before response delivery for transient GET/HEAD failures; defaults to 2 (maximum 10). */
+  maxRetries?: number;
   /** Maximum concurrent metadata tasks per model. Defaults to 8. */
   concurrency?: number;
   /** Override the Hub base URL. */

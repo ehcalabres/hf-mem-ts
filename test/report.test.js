@@ -8,6 +8,7 @@ test("shows Diffusers components as model sub-rows", () => {
   const result = {
     modelId: "org/diffusers",
     revision: "main",
+    resolvedRevision: "c".repeat(40),
     format: "safetensors",
     filename: null,
     weightsBytes: 15 * 2 ** 30,
@@ -30,6 +31,7 @@ test("shows Diffusers components as model sub-rows", () => {
   };
 
   const output = formatResult(result);
+  assert.match(output, /Resolved revision:\s+c{40}/);
   assert.match(output, /Model:\s+15\.00 GiB/);
   assert.match(output, /  VAE:\s+1\.00 GiB/);
   assert.match(output, /  TEXT ENCODER:\s+8\.00 GiB/);

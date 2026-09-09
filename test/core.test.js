@@ -78,6 +78,7 @@ test("estimates a Hub Safetensors model through an injected fetch", async () => 
   const file = safetensorsFile({ weight: { dtype: "F16", shape: [10, 10], data_offsets: [0, 200] } });
   const fetcher = async (input, init = {}) => {
     const url = String(input);
+    if (url.includes("/revision/")) return Response.json({ sha: "a".repeat(40) });
     if (url.includes("/tree/")) return Response.json([
       { type: "file", path: "model.safetensors" }, { type: "file", path: "config.json" },
     ]);
@@ -96,6 +97,7 @@ test("estimates a Hub Safetensors model through an injected fetch", async () => 
 test("keeps embedded GGUF metadata internal to the parser", async () => {
   const file = ggufFile();
   const fetcher = async (input, init = {}) => {
+    if (String(input).includes("/revision/")) return Response.json({ sha: "a".repeat(40) });
     if (String(input).includes("/tree/")) return Response.json([{ type: "file", path: "model-Q4_K.gguf" }]);
     assert.match(new Headers(init.headers).get("range"), /^bytes=0-/);
     return new Response(file, { status: 206 });
@@ -109,6 +111,7 @@ test("adds an auto-selected F16 mmproj and a separate draft model to total memor
   const file = ggufFile();
   const fetcher = async (input) => {
     const url = String(input);
+    if (url.includes("/revision/")) return Response.json({ sha: "a".repeat(40) });
     if (url.includes("/api/models/org/main/tree/")) return Response.json([
       { type: "file", path: "main-Q4_K.gguf" },
       { type: "file", path: "mmproj-BF16.gguf" },
@@ -144,6 +147,7 @@ test("estimates target and draft models concurrently", async () => {
     await new Promise((resolve) => setTimeout(resolve, 5));
     active--;
     const url = String(input);
+    if (url.includes("/revision/")) return Response.json({ sha: "a".repeat(40) });
     if (url.includes("/tree/")) return Response.json([{ type: "file", path: "model.safetensors" }]);
     const match = new Headers(init.headers).get("range").match(/bytes=(\d+)-(\d+)/);
     return new Response(file.slice(Number(match[1]), Number(match[2]) + 1), { status: 206 });
@@ -166,6 +170,7 @@ test("fetches multiple Safetensors indexes concurrently", async () => {
   let maxActiveIndexes = 0;
   const fetcher = async (input, init = {}) => {
     const url = String(input);
+    if (url.includes("/revision/")) return Response.json({ sha: "a".repeat(40) });
     if (url.includes("/tree/")) return Response.json([
       { type: "file", path: "encoder/model.safetensors.index.json" },
       { type: "file", path: "decoder/model.safetensors.index.json" },
@@ -206,6 +211,7 @@ test("discovers mixed sharded and unsharded Diffusers components from model_inde
   };
   const fetcher = async (input, init = {}) => {
     const url = String(input);
+    if (url.includes("/revision/")) return Response.json({ sha: "a".repeat(40) });
     if (url.includes("/tree/")) return Response.json([
       { type: "file", path: "model_index.json" },
       { type: "file", path: "text_encoder/model.safetensors.index.json" },
@@ -249,6 +255,7 @@ test("reuses metadata when target and draft select the same model file", async (
   let treeRequests = 0;
   let rangeRequests = 0;
   const fetcher = async (input) => {
+    if (String(input).includes("/revision/")) return Response.json({ sha: "a".repeat(40) });
     if (String(input).includes("/tree/")) {
       treeRequests++;
       return Response.json([{ type: "file", path: "model-Q4_K.gguf" }]);
