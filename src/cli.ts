@@ -7,7 +7,7 @@ const VERSION = "0.1.0";
 function usage(): string {
   return `hf-mem-ts ${VERSION}
 
-Estimate model weights and optional KV-cache memory without downloading weights.
+Estimate resident model weights and optional cache from remote file metadata.
 
 Usage:
   hf-mem-ts <owner/model> [options]
@@ -26,6 +26,8 @@ Options:
       --max-model-len <n>   Override context length
       --batch-size <n>      Batch size (default: 1)
       --concurrency <n>     Parallel metadata requests per model (default: 8)
+      --request-timeout-ms <n> Request deadline in ms, including retries/body (1-2147483647; default: 30000)
+      --max-retries <n>     Transient request retries (0-10; default: 2; 0 disables)
       --kv-cache-dtype <d>  KV dtype (default: auto; GGUF auto is F16)
       --sliding-window-policy <p> optimized (default) or full-context allocation
       --mla-layout <layout> compressed (default) or expanded MLA cache
@@ -48,6 +50,8 @@ interface Args {
   maxModelLen?: number;
   batchSize?: number;
   concurrency?: number;
+  requestTimeoutMs?: number;
+  maxRetries?: number;
   kvCacheDtype?: string;
   slidingWindowPolicy?: "optimized" | "full-context";
   mlaLayout?: "compressed" | "expanded";
@@ -58,9 +62,11 @@ interface Args {
   version?: boolean;
 }
 
-function parseInteger(value: string | undefined, flag: string): number {
+function parseInteger(value: string | undefined, flag: string, minimum = 1): number {
   const number = Number(value);
-  if (!Number.isSafeInteger(number) || number <= 0) throw new Error(`${flag} requires a positive integer.`);
+  if (!Number.isSafeInteger(number) || number < minimum) {
+    throw new Error(`${flag} requires a ${minimum === 0 ? "non-negative" : "positive"} integer.`);
+  }
   return number;
 }
 
@@ -86,6 +92,8 @@ function parseArgs(argv: string[]): Args {
       case "--max-model-len": args.maxModelLen = parseInteger(take(i++, value), value); break;
       case "--batch-size": args.batchSize = parseInteger(take(i++, value), value); break;
       case "--concurrency": args.concurrency = parseInteger(take(i++, value), value); break;
+      case "--request-timeout-ms": args.requestTimeoutMs = parseInteger(take(i++, value), value); break;
+      case "--max-retries": args.maxRetries = parseInteger(take(i++, value), value, 0); break;
       case "--kv-cache-dtype": args.kvCacheDtype = take(i++, value); break;
       case "--sliding-window-policy": {
         const policy = take(i++, value);
@@ -134,6 +142,8 @@ async function main(): Promise<void> {
     ...(args.maxModelLen ? { maxModelLen: args.maxModelLen } : {}),
     ...(args.batchSize ? { batchSize: args.batchSize } : {}),
     ...(args.concurrency ? { concurrency: args.concurrency } : {}),
+    ...(args.requestTimeoutMs !== undefined ? { requestTimeoutMs: args.requestTimeoutMs } : {}),
+    ...(args.maxRetries !== undefined ? { maxRetries: args.maxRetries } : {}),
     ...(args.kvCacheDtype ? { kvCacheDtype: args.kvCacheDtype } : {}),
     ...(args.slidingWindowPolicy ? { slidingWindowPolicy: args.slidingWindowPolicy } : {}),
     ...(args.mlaLayout ? { mlaLayout: args.mlaLayout } : {}),

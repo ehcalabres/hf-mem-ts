@@ -51,10 +51,10 @@
   ],
   "license": "MIT",
   "engines": {
-    "node": ">=18"
+    "node": ">=18.17"
   },
   "devDependencies": {
-    "@types/node": "^24.0.0",
+    "@types/node": "^18.19.0",
     "typescript": "^5.9.0"
   }
 }
