@@ -31,7 +31,7 @@ Options:
       --kv-cache-dtype <d>  KV dtype (default: auto; GGUF auto is F16)
       --sliding-window-policy <p> optimized (default) or full-context allocation
       --mla-layout <layout> compressed (default) or expanded MLA cache
-      --recurrent-state-dtype <d> Qwen3.5 recurrent storage precision override
+      --recurrent-state-dtype <d> Recurrent storage precision override
       --token <token>       Hugging Face token (or use HF_TOKEN)
       --json                Print machine-readable JSON
   -h, --help                Show help

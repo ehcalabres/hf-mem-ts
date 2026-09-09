@@ -91,6 +91,7 @@ export function formatResult(result: EstimateResult): string {
       if (!cache) continue;
       cacheDetails.push(
         `${label} ${filename}: ${cache.layout}, ${cache.dtype} attention, ${cache.slidingWindowPolicy} allocation`,
+        `  Estimate: ${cache.approximate ? "approximate (see assumptions)" : "metadata-derived (runtime overhead excluded)"}`,
         `  Context: ${cache.maxModelLen} tokens; batch: ${cache.batchSize}`,
         `  Layers: ${cache.fullAttentionLayers} full attention, ${cache.slidingAttentionLayers} sliding attention, ${cache.recurrentLayers} recurrent`,
         `  Attention payload: ${gib(cache.attentionBytes)} (${cache.attentionBytes} bytes)`,

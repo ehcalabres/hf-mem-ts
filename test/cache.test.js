@@ -65,7 +65,7 @@ test("Qwen3.5 counts six attention caches and eighteen length-independent Gated 
   assert.equal(cache.slidingAttentionLayers, 0);
   assert.equal(cache.recurrentDtype, "F32");
   assert.equal(cache.convolutionDtype, "BF16");
-  assert.equal(cache.layout, "qwen3.5-hybrid");
+  assert.equal(cache.layout, "hybrid");
   const longer = estimateSafetensorsKvCache(qwen35, { maxModelLen: 65536 });
   assert.equal(longer.attentionBytes, 805306368);
   assert.equal(longer.stateBytes, 19759104);
@@ -132,10 +132,10 @@ test("auto cache dtype ignores weight-only FP8 and honors only explicit cache pr
   assert.equal(resolveSafetensorsKvDtype({ torch_dtype: "bfloat16", quantization_config: { quant_method: "modelopt", format: "e5m2" } }), "BF16");
   assert.equal(resolveSafetensorsKvDtype({ torch_dtype: "bfloat16", quantization_config: { kv_cache_scheme: { num_bits: 8, type: "float" } } }), "F8_E4M3");
   assert.equal(resolveSafetensorsKvDtype({ torch_dtype: "float16", kv_cache_dtype: "fp8_e5m2" }), "F8_E5M2");
-  assert.throws(() => resolveSafetensorsKvDtype({ quantization_config: { quant_method: "fp8" } }), /infer/);
-  assert.throws(() => resolveSafetensorsKvDtype({ dtype: "float16", torch_dtype: "bfloat16" }), /Conflicting/);
+  assert.equal(resolveSafetensorsKvDtype({ quantization_config: { quant_method: "fp8" } }), "F16");
+  assert.equal(resolveSafetensorsKvDtype({ dtype: "float16", torch_dtype: "float32" }), "F32");
   assert.equal(resolveSafetensorsKvDtype({ dtype: "float16", torch_dtype: "bfloat16" }, "bf16"), "BF16");
-  assert.throws(() => resolveSafetensorsKvDtype({ kv_cache_dtype: "bf16", quantization_config: { kv_cache_dtype: "fp8" } }), /Conflicting/);
+  assert.equal(resolveSafetensorsKvDtype({ kv_cache_dtype: "bf16", quantization_config: { kv_cache_dtype: "fp8" } }), "BF16");
 });
 
 test("GGUF uses the selected architecture namespace and separate explicit key/value dimensions", () => {
@@ -151,10 +151,12 @@ test("GGUF uses the selected architecture namespace and separate explicit key/va
   assert.throws(() => estimateGgufKvCache(ambiguous), /unambiguous/);
 });
 
-test("GGUF quantized cache rows include block scales and reject unmodeled padding", () => {
+test("GGUF cache quantization uses effective bits even without exact row packing", () => {
   assert.equal(estimateGgufKvCache(gguf, { dtype: "Q8_0" }).bytes, 285212672);
-  assert.throws(() => estimateGgufKvCache({ ...gguf, "llama.attention.key_length": 129 }, { dtype: "Q8_0" }), /padding/);
-  assert.throws(() => estimateGgufKvCache(gguf, { dtype: "Q4_K" }), /Unsupported/);
+  const unaligned = estimateGgufKvCache({ ...gguf, "llama.attention.key_length": 129 }, { dtype: "Q8_0" });
+  assert.equal(unaligned.bytes, 286326784);
+  assert.equal(unaligned.approximate, true);
+  assert.equal(estimateGgufKvCache(gguf, { dtype: "Q4_K" }).bytes, 150994944);
 });
 
 test("low-level estimators reject invalid lengths, dimensions and unsafe arithmetic", () => {
@@ -165,28 +167,37 @@ test("low-level estimators reject invalid lengths, dimensions and unsafe arithme
     assert.throws(() => estimateGgufKvCache(gguf, { batchSize: value }), RangeError);
   }
   assert.throws(() => estimateSafetensorsKvCache({ ...gqa, head_dim: -1 }), RangeError);
-  assert.throws(() => estimateSafetensorsKvCache({ ...gqa, hidden_size: 4097 }), RangeError);
-  assert.throws(() => estimateGgufKvCache({ ...gguf, "llama.embedding_length": 4097 }), RangeError);
+  assert.equal(estimateSafetensorsKvCache({ ...gqa, hidden_size: 4097 }).bytes, 541065216);
+  assert.equal(estimateGgufKvCache({ ...gguf, "llama.embedding_length": 4097 }).bytes, 541065216);
   assert.throws(() => estimateGgufKvCache({ ...gguf, "llama.attention.value_length": -1 }), RangeError);
   assert.throws(() => estimateSafetensorsKvCache(gqa, { maxModelLen: Number.MAX_SAFE_INTEGER }), RangeError);
   assert.throws(() => estimateGgufKvCache(gguf, { maxModelLen: Number.MAX_SAFE_INTEGER }), RangeError);
 });
 
-test("unknown and model-specific layouts fail explicitly instead of becoming sliding caches", () => {
-  assert.throws(() => estimateSafetensorsKvCache({ ...gqa, layer_types: Array(32).fill("unknown_attention") }), /Unsupported cache layout/);
-  assert.throws(() => estimateSafetensorsKvCache({ ...gqa, layer_types: Array(32).fill("linear_attention") }), /Unsupported cache layout/);
-  assert.throws(() => estimateSafetensorsKvCache({ ...gqa, model_type: "future_architecture" }), /Unsupported cache layout/);
-  assert.throws(() => estimateSafetensorsKvCache({ ...gqa, model_type: "mamba" }), /Unsupported cache layout/);
-  assert.throws(() => estimateSafetensorsKvCache({ ...gqa, num_kv_shared_layers: 2 }), /sharing/);
-  assert.throws(() => estimateSafetensorsKvCache({ ...gqa, layer_types: ["full_attention"] }), /one entry/);
-  assert.throws(() => estimateGgufKvCache({ ...gguf, "general.architecture": "qwen35" }), /Unsupported GGUF cache layout/);
+test("model names never gate cache support and unfamiliar layers receive explicit proxies", () => {
+  assert.deepEqual(estimateSafetensorsKvCache({ ...gqa, model_type: "future_architecture" }), estimateSafetensorsKvCache(gqa));
+  const unknown = estimateSafetensorsKvCache({ ...gqa, layer_types: Array(32).fill("unknown_attention") });
+  assert.equal(unknown.bytes, 536870912);
+  assert.equal(unknown.approximate, true);
+  const recurrent = estimateSafetensorsKvCache({ ...gqa, layer_types: Array(32).fill("linear_attention") });
+  assert.equal(recurrent.bytes, 536870912);
+  assert.equal(recurrent.recurrentLayers, 32);
+  assert.equal(recurrent.approximate, true);
+  assert.match(recurrent.assumptions.join(" "), /proxy/);
+  const shared = estimateSafetensorsKvCache({ ...gqa, num_kv_shared_layers: 2 });
+  assert.equal(shared.bytes, 536870912);
+  assert.equal(shared.approximate, true);
+  assert.equal(estimateSafetensorsKvCache({ ...gqa, layer_types: ["full_attention"] }).bytes, 536870912);
 });
 
-test("GGUF rejects encoder, shared-cache and incomplete window layouts", () => {
-  assert.throws(() => estimateGgufKvCache({ ...gguf, "general.architecture": "bert" }), /Unsupported GGUF cache layout/);
-  assert.throws(() => estimateGgufKvCache({ ...gguf, "llama.attention.causal": false }), /non-causal/);
-  assert.throws(() => estimateGgufKvCache({ ...gguf, "llama.attention.shared_kv_layers": 4 }), /sharing/);
-  assert.throws(() => estimateGgufKvCache({ ...gguf, "llama.attention.sliding_window_pattern": 2 }), /without sliding_window/);
+test("GGUF noncausal, shared-cache and incomplete window metadata remain estimable", () => {
+  const noncausal = estimateGgufKvCache({ ...gguf, "llama.attention.causal": false });
+  assert.equal(noncausal.bytes, 536870912);
+  assert.equal(noncausal.approximate, true);
+  assert.equal(estimateGgufKvCache({ ...gguf, "llama.attention.shared_kv_layers": 4 }).bytes, 536870912);
+  const missingWindow = estimateGgufKvCache({ ...gguf, "llama.attention.sliding_window_pattern": 2 });
+  assert.equal(missingWindow.bytes, 536870912);
+  assert.equal(missingWindow.approximate, true);
 });
 
 test("reports actual target and draft cache layouts, state sizes and independent storage policies", () => {
@@ -204,10 +215,80 @@ test("reports actual target and draft cache layouts, state sizes and independent
     },
   };
   const output = formatResult(result);
-  assert.match(output, /Target safetensors: qwen3\.5-hybrid, BF16 attention/);
+  assert.match(output, /Target safetensors: hybrid, BF16 attention/);
   assert.match(output, /Attention payload: [^\n]*402653184 bytes/);
   assert.match(output, /Convolution state: 884736 bytes \(BF16\)/);
   assert.match(output, /Recurrent state: 18874368 bytes \(F32\)/);
-  assert.match(output, /Draft safetensors: qwen3\.5-hybrid, BF16 attention/);
+  assert.match(output, /Draft safetensors: hybrid, BF16 attention/);
   assert.match(output, /Recurrent state: 9437184 bytes \(BF16\)/);
+});
+
+test("common dimension aliases and MQA/GQA hints work without named architectures", () => {
+  const config = { n_layer: 2, n_embd: 16, n_head: 4, n_positions: 8, torch_dtype: "float16" };
+  assert.equal(estimateSafetensorsKvCache(config).bytes, 1024);
+  assert.equal(estimateSafetensorsKvCache({ ...config, multi_query: true }).bytes, 256);
+  assert.equal(estimateSafetensorsKvCache({ ...config, attn_config: { kv_n_heads: 2 } }).bytes, 512);
+});
+
+
+test("missing query counts preserve full projection width when head dimensions exist", () => {
+  const config = { num_hidden_layers: 2, hidden_size: 16, head_dim: 4, max_position_embeddings: 8, dtype: "float16" };
+  const mha = estimateSafetensorsKvCache(config);
+  assert.equal(mha.bytes, 1024);
+  assert.equal(mha.approximate, true);
+  assert.equal(estimateSafetensorsKvCache({ ...config, num_key_value_heads: 2 }).bytes, 512);
+});
+test("missing context, heads and dtype produce a disclosed full-width estimate", () => {
+  const config = { num_layers: 2, d_model: 8, model_type: "brand_new_decoder" };
+  const cache = estimateSafetensorsKvCache(config);
+  assert.equal(cache.bytes, 262144);
+  assert.equal(cache.maxModelLen, 4096);
+  assert.equal(cache.dtype, "F16");
+  assert.equal(cache.approximate, true);
+  assert.equal(estimateSafetensorsKvCache(config, { maxModelLen: 16, dtype: "float32" }).bytes, 2048);
+  assert.throws(() => estimateSafetensorsKvCache({ num_layers: 2, n_head: 2 }), /Insufficient cache dimensions/);
+});
+
+test("nested decoder precision and global head dimensions override outer/local values", () => {
+  const cache = estimateSafetensorsKvCache({
+    torch_dtype: "float32",
+    language_model_config: {
+      dtype: "bfloat16", hidden_size: 8, num_hidden_layers: 2, num_attention_heads: 2,
+      num_key_value_heads: 2, head_dim: 4, global_head_dim: 16, num_global_key_value_heads: 1,
+      max_position_embeddings: 16, sliding_window: 4, layer_types: ["sliding_attention", "full_attention"],
+    },
+  });
+  assert.equal(cache.dtype, "BF16");
+  assert.equal(cache.bytes, 1152);
+});
+
+test("state dimensions determine recurrent storage independently of model names and context", () => {
+  const config = {
+    model_type: "future_ssm", d_model: 8, n_layer: 3, d_inner: 16, d_state: 4, d_conv: 3,
+    dtype: "bfloat16", state_dtype: "float32", layer_types: ["ssm", "ssm", "ssm"],
+  };
+  const cache = estimateSafetensorsKvCache(config, { maxModelLen: 16 });
+  assert.equal(cache.convolutionBytes, 288);
+  assert.equal(cache.recurrentBytes, 768);
+  assert.equal(cache.bytes, 1056);
+  assert.equal(cache.attentionBytes, 0);
+  assert.equal(cache.layout, "recurrent");
+  assert.equal(estimateSafetensorsKvCache(config, { maxModelLen: 32768 }).bytes, 1056);
+  assert.equal(estimateSafetensorsKvCache({ ...qwen35.text_config, model_type: "future_linear_decoder" }, { maxModelLen: 32768 }).bytes, 422412288);
+});
+
+test("MLA-only dimensions and indexer metadata improve estimates without a model registry", () => {
+  assert.equal(estimateSafetensorsKvCache({ num_hidden_layers: 2, kv_lora_rank: 5, qk_rope_head_dim: 2 }, { maxModelLen: 8 }).bytes, 224);
+  const indexed = estimateSafetensorsKvCache({ ...deepseek, index_head_dim: 128, index_n_heads: 32 }, { maxModelLen: 1 });
+  assert.equal(indexed.bytes, 85888);
+  assert.equal(indexed.approximate, true);
+});
+
+test("encoder-decoder aliases include an explicit cross-attention length approximation", () => {
+  const cache = estimateSafetensorsKvCache({
+    model_type: "new_encoder_decoder", decoder_layers: 2, decoder_attention_heads: 2,
+    d_model: 8, max_position_embeddings: 16, dtype: "float16", is_encoder_decoder: true,
+  });
+  assert.equal(cache.bytes, 2048);
+  assert.equal(cache.approximate, true);
 });

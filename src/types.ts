@@ -30,7 +30,9 @@ export interface KvCacheEstimate {
   recurrentBytes: number;
   convolutionDtype: string | null;
   recurrentDtype: string | null;
-  layout: "attention" | "mla-compressed" | "mla-expanded" | "qwen3.5-hybrid";
+  layout: "attention" | "mla-compressed" | "mla-expanded" | "hybrid" | "recurrent";
+  /** True when defaults, structural proxies, or packing approximations were needed; see assumptions. */
+  approximate: boolean;
   slidingWindowPolicy: "optimized" | "full-context";
   fullAttentionLayers: number;
   slidingAttentionLayers: number;
@@ -46,7 +48,7 @@ export interface KvCacheOptions {
   slidingWindowPolicy?: "optimized" | "full-context";
   /** MLA storage choice. Defaults to compressed (latent plus shared RoPE key). */
   mlaLayout?: "compressed" | "expanded";
-  /** Qwen3.5 recurrent storage precision; config mamba_ssm_dtype or F32 if omitted. */
+  /** Recurrent storage precision; config mamba_ssm_dtype/state_dtype or F32 if omitted. */
   recurrentStateDtype?: string;
 }
 
@@ -118,7 +120,7 @@ export interface EstimateOptions {
   slidingWindowPolicy?: "optimized" | "full-context";
   /** MLA backend storage layout; defaults to compressed, not universal across engines. */
   mlaLayout?: "compressed" | "expanded";
-  /** Override Qwen3.5 recurrent state storage dtype to match the backend. */
+  /** Override recurrent state storage dtype to match the backend. */
   recurrentStateDtype?: string;
   /** Override fetch, useful for SSR, tests, proxies, or non-browser runtimes. */
   fetch?: FetchLike;
