@@ -21,6 +21,12 @@ After publication, replace `npx --no-install .` with `npx hf-mem-ts` to run the 
 
 Use `--max-model-len`, `--batch-size`, and `--kv-cache-dtype` to change cache assumptions. Metadata for separate files is fetched concurrently (8 tasks per model by default); use `--concurrency` to tune the limit. Authentication uses `HF_TOKEN`, or `--token` (avoid the latter in shared shell history).
 
+Use `--request-timeout-ms` to set the per-request deadline in milliseconds (default `30000`, range `1`–`2147483647`), including retry delays and response-body reads. Use `--max-retries` to set transient request retries (default `2`, range `0`–`10`); `0` disables retries. Both settings apply to the target and any draft model, using the same policy as the library API.
+
+```sh
+npx --no-install . HuggingFaceTB/SmolLM2-135M --request-timeout-ms 60000 --max-retries 0
+```
+
 ## Diffusers
 
 Diffusers repositories are detected through `model_index.json`. Every referenced component with canonical Safetensors weights is included, such as `transformer`, `text_encoder`, `text_encoder_2`, and `vae`. Components can independently use a single weights file or a sharded index; their metadata requests still respect the configured concurrency limit.
