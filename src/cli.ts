@@ -7,7 +7,7 @@ const VERSION = "0.1.0";
 function usage(): string {
   return `hf-mem-ts ${VERSION}
 
-Estimate model weights and optional KV-cache memory without downloading weights.
+Estimate resident model weights and optional cache from remote file metadata.
 
 Usage:
   hf-mem-ts <owner/model> [options]
@@ -26,6 +26,8 @@ Options:
       --max-model-len <n>   Override context length
       --batch-size <n>      Batch size (default: 1)
       --concurrency <n>     Parallel metadata requests per model (default: 8)
+      --request-timeout-ms <n> Request deadline in ms, including retries/body (1-2147483647; default: 30000)
+      --max-retries <n>     Transient request retries (0-10; default: 2; 0 disables)
       --kv-cache-dtype <d>  KV dtype (default: auto; GGUF auto is F16)
       --token <token>       Hugging Face token (or use HF_TOKEN)
       --json                Print machine-readable JSON
@@ -45,6 +47,8 @@ interface Args {
   maxModelLen?: number;
   batchSize?: number;
   concurrency?: number;
+  requestTimeoutMs?: number;
+  maxRetries?: number;
   kvCacheDtype?: string;
   token?: string;
   json?: boolean;
@@ -52,9 +56,11 @@ interface Args {
   version?: boolean;
 }
 
-function parseInteger(value: string | undefined, flag: string): number {
+function parseInteger(value: string | undefined, flag: string, minimum = 1): number {
   const number = Number(value);
-  if (!Number.isSafeInteger(number) || number <= 0) throw new Error(`${flag} requires a positive integer.`);
+  if (!Number.isSafeInteger(number) || number < minimum) {
+    throw new Error(`${flag} requires a ${minimum === 0 ? "non-negative" : "positive"} integer.`);
+  }
   return number;
 }
 
@@ -80,6 +86,8 @@ function parseArgs(argv: string[]): Args {
       case "--max-model-len": args.maxModelLen = parseInteger(take(i++, value), value); break;
       case "--batch-size": args.batchSize = parseInteger(take(i++, value), value); break;
       case "--concurrency": args.concurrency = parseInteger(take(i++, value), value); break;
+      case "--request-timeout-ms": args.requestTimeoutMs = parseInteger(take(i++, value), value); break;
+      case "--max-retries": args.maxRetries = parseInteger(take(i++, value), value, 0); break;
       case "--kv-cache-dtype": args.kvCacheDtype = take(i++, value); break;
       case "--token": args.token = take(i++, value); break;
       case "--json": args.json = true; break;
@@ -115,6 +123,8 @@ async function main(): Promise<void> {
     ...(args.maxModelLen ? { maxModelLen: args.maxModelLen } : {}),
     ...(args.batchSize ? { batchSize: args.batchSize } : {}),
     ...(args.concurrency ? { concurrency: args.concurrency } : {}),
+    ...(args.requestTimeoutMs !== undefined ? { requestTimeoutMs: args.requestTimeoutMs } : {}),
+    ...(args.maxRetries !== undefined ? { maxRetries: args.maxRetries } : {}),
     ...(args.kvCacheDtype ? { kvCacheDtype: args.kvCacheDtype } : {}),
     ...(token ? { token } : {}),
   });
