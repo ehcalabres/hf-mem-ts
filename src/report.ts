@@ -59,7 +59,7 @@ export function formatResult(result: EstimateResult): string {
   if (typeof result.weightsBytes === "number") {
     memory.push(["Model", gib(result.weightsBytes)]);
     memory.push(...componentRows(result));
-    if (typeof result.kvCacheBytes === "number") memory.push(["KV cache", gib(result.kvCacheBytes)]);
+    if (typeof result.kvCacheBytes === "number") memory.push(["KV cache payload", gib(result.kvCacheBytes)]);
   } else {
     memory.push(...alternativeRows(result));
   }
@@ -73,7 +73,7 @@ export function formatResult(result: EstimateResult): string {
       memory.push(...alternativeRows(result.draft, "  "));
     }
     if (typeof result.draft.kvCacheBytes === "number") {
-      memory.push(["Draft model KV cache", gib(result.draft.kvCacheBytes)]);
+      memory.push(["Draft model cache payload", gib(result.draft.kvCacheBytes)]);
     }
   }
   const selections = [
@@ -92,9 +92,10 @@ export function formatResult(result: EstimateResult): string {
       cacheDetails.push(
         `${label} ${filename}: ${cache.layout}, ${cache.dtype} attention, ${cache.slidingWindowPolicy} allocation`,
         `  Estimate: ${cache.approximate ? "approximate (see assumptions)" : "metadata-derived (runtime overhead excluded)"}`,
-        `  Context: ${cache.maxModelLen} tokens; batch: ${cache.batchSize}`,
+        `  Context: ${cache.maxModelLen} tokens; batch: ${cache.batchSize}; tensor parallel: ${cache.tensorParallelSize}`,
         `  Layers: ${cache.fullAttentionLayers} full attention, ${cache.slidingAttentionLayers} sliding attention, ${cache.recurrentLayers} recurrent`,
         `  Attention payload: ${gib(cache.attentionBytes)} (${cache.attentionBytes} bytes)`,
+        `    Indexer payload (included above): ${gib(cache.indexerBytes)} (${cache.indexerBytes} bytes)`,
         `  Persistent state: ${gib(cache.stateBytes)} (${cache.stateBytes} bytes)`,
       );
       if (cache.recurrentLayers) {
@@ -104,6 +105,7 @@ export function formatResult(result: EstimateResult): string {
         );
       }
       cacheDetails.push(...cache.assumptions.map((assumption) => `  - ${assumption}`));
+      if (cache.recurrentLayers) cacheDetails.push("  vLLM occupied-pool memory: not predicted; depends on cache groups, page padding and checkpoint policy.");
     }
   }
 

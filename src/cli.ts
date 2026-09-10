@@ -29,6 +29,7 @@ Options:
       --request-timeout-ms <n> Request deadline in ms, including retries/body (1-2147483647; default: 30000)
       --max-retries <n>     Transient request retries (0-10; default: 2; 0 disables)
       --kv-cache-dtype <d>  KV dtype (default: auto; GGUF auto is F16)
+      --tensor-parallel-size <n> Cache payload across TP ranks (default: 1; excludes pool padding)
       --sliding-window-policy <p> optimized (default) or full-context allocation
       --mla-layout <layout> compressed (default) or expanded MLA cache
       --recurrent-state-dtype <d> Recurrent storage precision override
@@ -53,6 +54,7 @@ interface Args {
   requestTimeoutMs?: number;
   maxRetries?: number;
   kvCacheDtype?: string;
+  tensorParallelSize?: number;
   slidingWindowPolicy?: "optimized" | "full-context";
   mlaLayout?: "compressed" | "expanded";
   recurrentStateDtype?: string;
@@ -95,6 +97,7 @@ function parseArgs(argv: string[]): Args {
       case "--request-timeout-ms": args.requestTimeoutMs = parseInteger(take(i++, value), value); break;
       case "--max-retries": args.maxRetries = parseInteger(take(i++, value), value, 0); break;
       case "--kv-cache-dtype": args.kvCacheDtype = take(i++, value); break;
+      case "--tensor-parallel-size": args.tensorParallelSize = parseInteger(take(i++, value), value); break;
       case "--sliding-window-policy": {
         const policy = take(i++, value);
         if (policy !== "optimized" && policy !== "full-context") throw new Error("--sliding-window-policy requires optimized or full-context.");
@@ -145,6 +148,7 @@ async function main(): Promise<void> {
     ...(args.requestTimeoutMs !== undefined ? { requestTimeoutMs: args.requestTimeoutMs } : {}),
     ...(args.maxRetries !== undefined ? { maxRetries: args.maxRetries } : {}),
     ...(args.kvCacheDtype ? { kvCacheDtype: args.kvCacheDtype } : {}),
+    ...(args.tensorParallelSize !== undefined ? { tensorParallelSize: args.tensorParallelSize } : {}),
     ...(args.slidingWindowPolicy ? { slidingWindowPolicy: args.slidingWindowPolicy } : {}),
     ...(args.mlaLayout ? { mlaLayout: args.mlaLayout } : {}),
     ...(args.recurrentStateDtype ? { recurrentStateDtype: args.recurrentStateDtype } : {}),

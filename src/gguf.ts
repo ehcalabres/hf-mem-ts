@@ -220,6 +220,9 @@ export function estimateGgufKvCache(
     ["linear_key_head_dim", "linear_key_head_dim", "attention.linear_key_head_dim"],
     ["linear_value_head_dim", "linear_value_head_dim", "attention.linear_value_head_dim"],
     ["linear_conv_kernel_dim", "linear_conv_kernel_dim", "attention.linear_conv_kernel_dim"],
+    ["index_head_dim", "attention.indexer.key_length", "attention.indexer.head_dim"],
+    ["index_kv_heads", "attention.indexer.head_count_kv"],
+    ["index_compress_ratio", "attention.indexer.compress_ratio"],
   ];
   for (const [key, ...suffixes] of mappings) {
     const value = field(...suffixes);
@@ -305,6 +308,7 @@ export function estimateGgufKvCache(
   const bits = GGUF_DTYPE_BITS[dtype]!;
   const estimate = estimateSafetensorsKvCache(config, { ...options, dtype: "F16" });
   const attentionBytes = Math.ceil(estimate.attentionBytes / 16 * bits);
+  const indexerBytes = Math.ceil(estimate.indexerBytes / 16 * bits);
   const bytes = attentionBytes + estimate.stateBytes;
   if (!Number.isSafeInteger(attentionBytes) || !Number.isSafeInteger(bytes) || attentionBytes < 0 || bytes < 0) {
     throw new RangeError("Cache estimate exceeds JavaScript's safe integer range.");
@@ -314,7 +318,7 @@ export function estimateGgufKvCache(
     assumptions.push(`GGUF ${dtype} uses ${bits} effective bits per attention-cache element including block scales, rounded up to whole bytes; row packing, block alignment and backend padding are unknown, so this is approximate, not a backend dtype-support guarantee.`);
   }
   return {
-    ...estimate, dtype, bytes, attentionBytes,
+    ...estimate, dtype, bytes, attentionBytes, indexerBytes,
     approximate: estimate.approximate || assumptions.length > 0,
     assumptions: [...estimate.assumptions,
       `GGUF ${architecture} is a metadata namespace, not a cache-layout restriction. Auto cache precision uses explicit cache dtype metadata or F16, independent of weight quantization; only attention storage is rescaled to ${dtype}.`,

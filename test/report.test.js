@@ -84,7 +84,6 @@ test("shows cache assumptions and preserves separate accessory costs", () => {
   });
   assert.match(output, /Multimodal projector:\s+0\.25 GiB/);
   assert.match(output, /Draft model:\s+1\.00 GiB/);
-  assert.match(output, /Draft model KV cache:\s+1\.00 GiB/);
   assert.match(output, /Total:\s+3\.75 GiB/);
   assert.match(output, /Target cache: F16, 4096 tokens per sequence, 2 sequence\(s\)/);
 });

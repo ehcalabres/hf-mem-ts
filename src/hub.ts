@@ -142,6 +142,7 @@ async function estimateSafetensors(
       batchSize: options.batchSize,
       ...(options.maxModelLen !== undefined ? { maxModelLen: options.maxModelLen } : {}),
       ...(options.kvCacheDtype !== undefined ? { dtype: options.kvCacheDtype } : {}),
+      ...(options.tensorParallelSize !== undefined ? { tensorParallelSize: options.tensorParallelSize } : {}),
       ...(options.slidingWindowPolicy !== undefined ? { slidingWindowPolicy: options.slidingWindowPolicy } : {}),
       ...(options.mlaLayout !== undefined ? { mlaLayout: options.mlaLayout } : {}),
       ...(options.recurrentStateDtype !== undefined ? { recurrentStateDtype: options.recurrentStateDtype } : {}),
@@ -226,6 +227,7 @@ async function estimateGguf(
       batchSize: options.batchSize,
       ...(options.maxModelLen !== undefined ? { maxModelLen: options.maxModelLen } : {}),
       ...(options.kvCacheDtype !== undefined ? { dtype: options.kvCacheDtype } : {}),
+      ...(options.tensorParallelSize !== undefined ? { tensorParallelSize: options.tensorParallelSize } : {}),
       ...(options.slidingWindowPolicy !== undefined ? { slidingWindowPolicy: options.slidingWindowPolicy } : {}),
       ...(options.mlaLayout !== undefined ? { mlaLayout: options.mlaLayout } : {}),
       ...(options.recurrentStateDtype !== undefined ? { recurrentStateDtype: options.recurrentStateDtype } : {}),
@@ -295,6 +297,7 @@ function draftOptions(input: EstimateOptions, draft: string | DraftModelOptions)
     ...((selected.maxModelLen ?? input.maxModelLen) !== undefined ? { maxModelLen: selected.maxModelLen ?? input.maxModelLen } : {}),
     ...((selected.batchSize ?? input.batchSize) !== undefined ? { batchSize: selected.batchSize ?? input.batchSize } : {}),
     ...((selected.kvCacheDtype ?? input.kvCacheDtype) !== undefined ? { kvCacheDtype: selected.kvCacheDtype ?? input.kvCacheDtype } : {}),
+    ...((selected.tensorParallelSize ?? input.tensorParallelSize) !== undefined ? { tensorParallelSize: selected.tensorParallelSize ?? input.tensorParallelSize } : {}),
     ...((selected.slidingWindowPolicy ?? input.slidingWindowPolicy) !== undefined ? { slidingWindowPolicy: selected.slidingWindowPolicy ?? input.slidingWindowPolicy } : {}),
     ...((selected.mlaLayout ?? input.mlaLayout) !== undefined ? { mlaLayout: selected.mlaLayout ?? input.mlaLayout } : {}),
     ...((selected.recurrentStateDtype ?? input.recurrentStateDtype) !== undefined ? { recurrentStateDtype: selected.recurrentStateDtype ?? input.recurrentStateDtype } : {}),
@@ -314,6 +317,7 @@ function draftMatchesTarget(
     && (draft.maxModelLen ?? options.maxModelLen) === options.maxModelLen
     && (draft.batchSize ?? options.batchSize) === options.batchSize
     && (draft.kvCacheDtype ?? options.kvCacheDtype) === options.kvCacheDtype
+    && (draft.tensorParallelSize ?? options.tensorParallelSize) === options.tensorParallelSize
     && (draft.slidingWindowPolicy ?? options.slidingWindowPolicy) === options.slidingWindowPolicy
     && (draft.mlaLayout ?? options.mlaLayout) === options.mlaLayout
     && (draft.recurrentStateDtype ?? options.recurrentStateDtype) === options.recurrentStateDtype;
@@ -338,12 +342,13 @@ export async function estimateModelMemory(input: EstimateOptions): Promise<Estim
 async function estimateModel(input: EstimateOptions, rawFetch: FetchLike, policy: RequestPolicy): Promise<EstimateResult> {
   if (!input.modelId?.includes("/")) throw new Error("modelId must be a Hugging Face repository ID such as owner/model.");
   const options = {
-    revision: "main", batchSize: 1, concurrency: 8, hubUrl: "https://huggingface.co", kvCacheDtype: "auto", ...input,
+    revision: "main", batchSize: 1, concurrency: 8, tensorParallelSize: 1, hubUrl: "https://huggingface.co", kvCacheDtype: "auto", ...input,
   };
   options.hubUrl = options.hubUrl.replace(/\/$/, "");
   assertPositiveInteger(options.batchSize, "batchSize");
   assertPositiveInteger(options.concurrency, "concurrency");
   if (options.maxModelLen !== undefined) assertPositiveInteger(options.maxModelLen, "maxModelLen");
+  assertPositiveInteger(options.tensorParallelSize, "tensorParallelSize");
   const fetcher = transportFetch(rawFetch, options.concurrency, policy);
   const headers = requestHeaders(options.token);
   const targetPromise = (async () => {

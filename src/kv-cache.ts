@@ -22,6 +22,9 @@ const ALIASES: Record<string, readonly string[]> = {
   conv_kernel: ["d_conv", "conv_kernel_size", "ssm_cfg.d_conv"],
   expand: ["expand_factor", "ssm_cfg.expand"],
   n_groups: ["num_groups", "ssm_cfg.ngroups", "ssm_cfg.n_groups"],
+  index_head_dim: ["indexer_head_dim"],
+  index_kv_heads: ["indexer_kv_heads"],
+  index_compress_ratio: ["indexer_compress_ratio"],
 };
 
 function record(value: unknown): value is JsonConfig {
@@ -150,6 +153,13 @@ export function estimateSafetensorsKvCache(rawConfig: JsonConfig, options: KvCac
   if (rawLength == null) note("Context length is absent; assuming 4096 tokens. Pass maxModelLen to match the workload.");
   const maxModelLen = positive(rawLength ?? 4096, "maxModelLen");
   const batchSize = positive(options.batchSize ?? 1, "batchSize");
+  const tensorParallelSize = positive(options.tensorParallelSize ?? 1, "tensorParallelSize");
+  const allocatedHeads = (count: number): number => {
+    const allocated = product(Math.ceil(count / tensorParallelSize), tensorParallelSize);
+    if (allocated !== count) note("Tensor parallelism replicates/rounds KV heads to at least one whole head per rank; aggregate payload includes those copies.");
+    return allocated;
+  };
+  if (tensorParallelSize > 1) note(`Payload is summed across ${tensorParallelSize} tensor-parallel ranks: head-sharded attention, replicated compressed latents/index keys, and sharded recurrent state. Backend-specific padding/replicated auxiliary states are not modeled.`);
   const slidingWindowPolicy = options.slidingWindowPolicy ?? "optimized";
   if (!["optimized", "full-context"].includes(slidingWindowPolicy)) throw new Error("slidingWindowPolicy must be optimized or full-context.");
   const mlaLayout = options.mlaLayout ?? "compressed";
@@ -212,7 +222,7 @@ export function estimateSafetensorsKvCache(rawConfig: JsonConfig, options: KvCac
     if (rank && mlaLayout === "compressed") {
       if (config.qk_rope_head_dim == null) note("MLA RoPE dimensions are absent; estimating the shared latent without an additional RoPE key.");
       assumptions.add("MLA capability fields select a shared compressed KV latent plus shared RoPE key per token; requires a compressed-cache backend.");
-      return { elements: sum(rank, rope ?? 0), mla: true };
+      return { elements: product(sum(rank, rope ?? 0), tensorParallelSize), mla: true };
     }
     const hidden = at("hidden_size", index);
     const explicitHeads = get("num_attention_heads");
@@ -236,15 +246,16 @@ export function estimateSafetensorsKvCache(rawConfig: JsonConfig, options: KvCac
       if (hidden % heads) note("hidden_size / attention heads is fractional; rounding each head dimension upward.");
     }
     const nope = at("qk_nope_head_dim", index, true);
-    const keyDim = get("key_head_dim") ?? (rope || nope ? sum(rope ?? 0, nope ?? 0) : undefined) ?? fallbackDim;
+    const keyDim = get("key_head_dim") ?? (nope ? sum(nope, rope ?? 0) : undefined) ?? fallbackDim ?? rope;
     const valueDim = get("value_head_dim") ?? fallbackDim;
     if (!keyDim || !valueDim) throw new Error("Insufficient cache dimensions: provide key/value head dimensions, head_dim, or hidden_size.");
     if (rank) assumptions.add("Expanded MLA retains separate per-query-head keys and values, without also retaining the compressed latent.");
     else assumptions.add("Attention stores separate key and value projections per KV head.");
-    return { elements: product(rank ? heads : kvHeads, sum(keyDim, valueDim)), mla: Boolean(rank) };
+    return { elements: product(allocatedHeads(rank ? heads : kvHeads), sum(keyDim, valueDim)), mla: Boolean(rank) };
   };
 
   let attentionBytes = 0;
+  let indexerBytes = 0;
   let convolutionBytes = 0;
   let recurrentBytes = 0;
   let convolutionDtype: string | null = null;
@@ -256,7 +267,7 @@ export function estimateSafetensorsKvCache(rawConfig: JsonConfig, options: KvCac
   const perLayerFields = [
     "hidden_size", "num_attention_heads", "num_key_value_heads", "head_dim", "key_head_dim", "value_head_dim",
     "global_head_dim", "global_num_attention_heads", "global_num_key_value_heads", "global_key_head_dim", "global_value_head_dim",
-    "kv_lora_rank", "qk_rope_head_dim", "qk_nope_head_dim", "index_head_dim", "intermediate_size", "expand",
+    "kv_lora_rank", "qk_rope_head_dim", "qk_nope_head_dim", "index_head_dim", "index_kv_heads", "index_compress_ratio", "intermediate_size", "expand",
     "linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim", "linear_conv_kernel_dim",
     "state_size", "conv_kernel", "n_groups",
   ];
@@ -278,8 +289,8 @@ export function estimateSafetensorsKvCache(rawConfig: JsonConfig, options: KvCac
         let convElements: number;
         let recurrentElements: number;
         if (hasLinear) {
-          const keyHeads = at("linear_num_key_heads", index)!;
-          const valueHeads = at("linear_num_value_heads", index)!;
+          const keyHeads = allocatedHeads(at("linear_num_key_heads", index)!);
+          const valueHeads = allocatedHeads(at("linear_num_value_heads", index)!);
           const keyDim = at("linear_key_head_dim", index)!;
           const valueDim = at("linear_value_head_dim", index)!;
           convElements = product(sum(product(2, keyHeads, keyDim), product(valueHeads, valueDim)), at("linear_conv_kernel_dim", index)!);
@@ -310,15 +321,23 @@ export function estimateSafetensorsKvCache(rawConfig: JsonConfig, options: KvCac
     if (crossAttention) attentionBytes = sum(attentionBytes, product(copies, batchSize, elements, width, maxModelLen));
     const indexDim = at("index_head_dim", index);
     if (indexDim) {
-      attentionBytes = sum(attentionBytes, product(copies, batchSize, indexDim, width, maxModelLen));
-      note("Indexer metadata adds one index_head_dim key vector per token/layer at cache precision; index quantization and scale buffers are approximated.");
+      const indexHeads = allocatedHeads(at("index_kv_heads", index) ?? 1);
+      const ratio = at("index_compress_ratio", index) ?? 1;
+      // A compressed-key cache retains one key per group plus its open raw group.
+      const rawRows = config.index_compress_ratio == null ? 0 : ratio;
+      const rows = sum(Math.ceil(maxModelLen / ratio), rawRows);
+      const layerIndexerBytes = product(copies, batchSize, indexHeads, indexDim, width, rows);
+      indexerBytes = sum(indexerBytes, layerIndexerBytes);
+      attentionBytes = sum(attentionBytes, layerIndexerBytes);
+      note(`Indexer cache uses ${indexDim}-element keys, ${indexHeads} aggregate KV heads, one key per ${ratio} token(s) and ${rawRows} raw history rows. Query indexer heads do not multiply storage; speculative/MRoPE tails and backend page padding are excluded.`);
     }
   }
   if (slidingAttentionLayers) assumptions.add(`Sliding-window allocation: ${slidingWindowPolicy}; transient prefill and boundary buffers are excluded.`);
   if (recurrentLayers && (convolutionBytes || recurrentBytes)) assumptions.add(`Convolution storage ${convolutionDtype}; recurrent storage ${recurrentDtype}. Configured precision is an assumption, not a backend storage guarantee.`);
+  if (recurrentLayers) note("Recurrent payload counts one state per sequence. Paged/prefix-caching engines can retain many checkpoints and pad heterogeneous cache groups; this payload is not an estimate of occupied vLLM pool blocks.");
   const stateBytes = sum(convolutionBytes, recurrentBytes);
   const layout: KvCacheEstimate["layout"] = recurrentLayers
     ? (fullAttentionLayers || slidingAttentionLayers ? "hybrid" : "recurrent")
     : mlaLayers ? (mlaLayout === "compressed" ? "mla-compressed" : "mla-expanded") : "attention";
-  return { bytes: sum(attentionBytes, stateBytes), dtype, maxModelLen, batchSize, attentionBytes, stateBytes, convolutionBytes, recurrentBytes, convolutionDtype, recurrentDtype, layout, approximate, slidingWindowPolicy, fullAttentionLayers, slidingAttentionLayers, recurrentLayers, assumptions: [...assumptions] };
+  return { bytes: sum(attentionBytes, stateBytes), dtype, maxModelLen, batchSize, tensorParallelSize, attentionBytes, indexerBytes, stateBytes, convolutionBytes, recurrentBytes, convolutionDtype, recurrentDtype, layout, approximate, slidingWindowPolicy, fullAttentionLayers, slidingAttentionLayers, recurrentLayers, assumptions: [...assumptions] };
 }

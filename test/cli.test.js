@@ -21,8 +21,12 @@ function invoke(args, options = {}, timeout = 10_000) {
         return new Response('temporarily unavailable', { status: 503, headers: { 'Retry-After': '0' } });
       }
       const url = String(input);
-      if (url.includes('/tree/')) return Response.json([{ type: 'file', path: 'model.safetensors' }]);
+      if (url.includes('/tree/')) return Response.json([
+        { type: 'file', path: 'model.safetensors' },
+        ...(process.env.TEST_CACHE_CONFIG ? [{ type: 'file', path: 'config.json' }] : []),
+      ]);
       if (url.includes('/api/models/')) return Response.json({ sha: 'a'.repeat(40) });
+      if (url.endsWith('config.json')) return Response.json(JSON.parse(process.env.TEST_CACHE_CONFIG));
       const range = new Headers(init.headers).get('range').match(/bytes=(\\d+)-(\\d+)/);
       if (!range) throw Error('Expected a range request');
       const start = Number(range[1]); const end = Math.min(Number(range[2]), file.length - 1);
@@ -105,4 +109,17 @@ test("CLI rejects out-of-range request policies before making network requests",
     assert.match(child.stderr, error);
     assert.doesNotMatch(child.stderr, /401/);
   }
+});
+
+test("CLI tensor parallelism changes aggregate KV payload and is inherited by the draft", () => {
+  const config = JSON.stringify({
+    hidden_size: 32, num_hidden_layers: 2, num_attention_heads: 8, num_key_value_heads: 1,
+    max_position_embeddings: 16, dtype: "float16",
+  });
+  const child = invoke(["org/model", "--kv-cache", "--tensor-parallel-size", "4", "--draft-model", "org/draft", "--json"], { TEST_CACHE_CONFIG: config });
+  assert.equal(child.status, 0, child.stderr);
+  const result = JSON.parse(child.stdout);
+  assert.equal(result.kvCacheBytes, 2048);
+  assert.equal(result.draft.kvCacheBytes, 2048);
+  assert.equal(result.totalBytes, 4104);
 });

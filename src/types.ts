@@ -19,12 +19,16 @@ export interface WeightMetadata {
 }
 
 export interface KvCacheEstimate {
-  /** Attention cache plus persistent convolution/recurrent state; excludes working memory. */
+  /** Aggregate cache tensor payload, not occupied backend pool bytes; excludes checkpoint/page overhead. */
   bytes: number;
   dtype: string;
   maxModelLen: number;
   batchSize: number;
+  /** Aggregate cache payload across these tensor-parallel ranks; defaults to one rank. */
+  tensorParallelSize: number;
   attentionBytes: number;
+  /** Indexer keys and raw compression history, included in attentionBytes. */
+  indexerBytes: number;
   stateBytes: number;
   convolutionBytes: number;
   recurrentBytes: number;
@@ -44,6 +48,8 @@ export interface KvCacheOptions {
   maxModelLen?: number;
   batchSize?: number;
   dtype?: string;
+  /** KV heads are sharded across ranks, with whole-head replication when necessary. */
+  tensorParallelSize?: number;
   /** Backend allocation policy, not the attention mask. Defaults to optimized. */
   slidingWindowPolicy?: "optimized" | "full-context";
   /** MLA storage choice. Defaults to compressed (latent plus shared RoPE key). */
@@ -92,6 +98,7 @@ export interface DraftModelOptions {
   maxModelLen?: number;
   batchSize?: number;
   kvCacheDtype?: string;
+  tensorParallelSize?: number;
   slidingWindowPolicy?: "optimized" | "full-context";
   mlaLayout?: "compressed" | "expanded";
   recurrentStateDtype?: string;
@@ -116,6 +123,8 @@ export interface EstimateOptions {
   batchSize?: number;
   /** Safetensors aliases (auto, bfloat16, fp8...) or a GGUF dtype (F16, Q8_0...). */
   kvCacheDtype?: string;
+  /** Aggregate payload for this many tensor-parallel ranks (default 1); does not include engine pool padding. */
+  tensorParallelSize?: number;
   /** Allocate window-limited attention caches or full context per attention layer. */
   slidingWindowPolicy?: "optimized" | "full-context";
   /** MLA backend storage layout; defaults to compressed, not universal across engines. */
