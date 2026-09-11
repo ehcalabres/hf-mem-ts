@@ -60,6 +60,8 @@ export interface KvCacheOptions {
 
 export interface FileEstimate extends WeightMetadata {
   kvCache: KvCacheEstimate | null;
+  /** Full cache breakdowns for TP=1,2,4,8 when no TP was selected; otherwise null. */
+  kvCacheByTp: Record<string, KvCacheEstimate> | null;
 }
 
 export interface MmprojEstimate extends WeightMetadata {
@@ -80,8 +82,12 @@ export interface EstimateResult {
   filename: string | null;
   weightsBytes: number | Record<string, number>;
   kvCacheBytes: number | Record<string, number> | null;
-  /** Null when the result contains multiple alternative GGUF quantizations. */
+  /** Default TP comparison: TP -> bytes, or TP -> GGUF filename -> bytes. Otherwise null. */
+  kvCacheBytesByTp: Record<string, number | Record<string, number>> | null;
+  /** Null for unresolved GGUF quantization or an active TP comparison. */
   totalBytes: number | null;
+  /** Per-TP target + projector + draft totals; null values require a GGUF selection. */
+  totalBytesByTp: Record<string, number | null> | null;
   files: Record<string, FileEstimate>;
   /** Multimodal projector loaded alongside a GGUF model, if present and enabled. */
   mmproj: MmprojEstimate | null;
@@ -123,7 +129,7 @@ export interface EstimateOptions {
   batchSize?: number;
   /** Safetensors aliases (auto, bfloat16, fp8...) or a GGUF dtype (F16, Q8_0...). */
   kvCacheDtype?: string;
-  /** Aggregate payload for this many tensor-parallel ranks (default 1); does not include engine pool padding. */
+  /** Aggregate cache payload for one TP size. Omit to compare TP=1,2,4,8 when kvCache is enabled. */
   tensorParallelSize?: number;
   /** Allocate window-limited attention caches or full context per attention layer. */
   slidingWindowPolicy?: "optimized" | "full-context";

@@ -100,4 +100,10 @@ test("same-repository draft can select a different parallel topology", async () 
   assert.equal(result.kvCacheBytes, 2048);
   assert.equal(result.draft.kvCacheBytes, 512);
   assert.equal(result.totalBytes, 2568);
+  assert.equal(result.kvCacheBytesByTp, null);
+  assert.equal(result.totalBytesByTp, null);
+  assert.equal(result.files.safetensors.kvCacheByTp, null);
+  assert.equal(result.draft.kvCacheBytesByTp, null);
+  assert.equal(result.draft.totalBytesByTp, null);
+  assert.equal(result.draft.files.safetensors.kvCacheByTp, null);
 });

@@ -15,10 +15,13 @@ npx --no-install . Qwen/Qwen3-1.7B --kv-cache --draft-model Qwen/Qwen3-0.6B
 npx --no-install . deepseek-ai/DeepSeek-V3 --kv-cache --mla-layout compressed --max-model-len 32768
 npx --no-install . Qwen/Qwen3.5-0.8B --kv-cache --max-model-len 32768 --json
 npx --no-install . unsloth/Qwen3.5-0.8B-GGUF --gguf-file Qwen3.5-0.8B-Q4_0.gguf --kv-cache
+npx --no-install . Qwen/Qwen3.5-0.8B --kv-cache --tensor-parallel-size 2 --json
 npx --no-install . black-forest-labs/FLUX.2-klein-4B --concurrency 16
 ```
 
 After publication, replace `npx --no-install .` with `npx hf-mem-ts` to run the package directly from npm.
+
+With `--kv-cache` and no `--tensor-parallel-size`, both text and JSON compare **TP 1, 2, 4, and 8** using the same fetched metadata. These are alternatives, not additive allocations; equal-valued alternatives are still returned. Specify `--tensor-parallel-size 2` (or another positive integer) for a single estimate. Without `--kv-cache`, no cache comparison or cache-only configuration fetch is performed.
 
 Use `--max-model-len`, `--batch-size`, and `--kv-cache-dtype` to change cache assumptions. Metadata for separate files is fetched concurrently (8 tasks per model by default); use `--concurrency` to tune the limit. Authentication uses `HF_TOKEN`, or `--token` (avoid the latter in shared shell history).
 
@@ -47,7 +50,7 @@ const estimate = await estimateModelMemory({
   concurrency: 16,
 });
 
-console.log(estimate.weightsBytes, estimate.kvCacheBytes, estimate.totalBytes);
+console.log(estimate.weightsBytes, estimate.kvCacheBytesByTp, estimate.totalBytesByTp);
 ```
 
 With a GGUF model and its automatically selected multimodal projector:
@@ -72,6 +75,19 @@ const estimate = await estimateModelMemory({
 });
 ```
 
+The draft inherits the target's TP choice: omission on both compares matching target/draft TP 1, 2, 4, and 8, while an explicit target TP produces matching single estimates. To hold the draft at one TP across target scenarios, use the library's object form:
+
+```ts
+const estimate = await estimateModelMemory({
+  modelId: "Qwen/Qwen3-1.7B",
+  kvCache: true,
+  draftModel: { modelId: "Qwen/Qwen3-0.6B", tensorParallelSize: 1 },
+});
+// totalBytesByTp["4"] includes target TP 4 + the fixed draft TP 1.
+```
+
+Explicit target and draft TP values may differ. Same-model drafts with identical settings reuse metadata; a draft fixed to one of the target's four comparison TPs can reuse that computed scenario rather than fetching the model again.
+
 The main entry point uses web-standard `fetch` and has no Node imports, so it can be bundled in Svelte/SvelteKit and other browser applications. Browser calls are subject to the model's access rules and Hugging Face CORS policy. For private or gated models, passing a token from browser code exposes it to the client; prefer calling the library from a server route.
 
 You can inject `fetch` for SvelteKit, SSR, a proxy, or tests:
@@ -92,7 +108,42 @@ Useful lower-level functions are exported from `hf-mem-ts/safetensors`, `hf-mem-
 
 ## Result shape
 
-Single Safetensors or selected GGUF results contain numeric `weightsBytes` and `kvCacheBytes`. `totalBytes` includes the target weights and KV cache plus `mmproj.bytes` and the complete `draft.totalBytes` when configured. When no GGUF file is selected, each repository quantization is returned in records keyed by filename and `totalBytes` is `null`, since those files are alternatives rather than additive weights. The `files` field contains parameter, component, and dtype breakdowns.
+`weightsBytes` is numeric for Safetensors and a selected GGUF (including a selected shard set). Without `ggufFile`, it is a filename-to-bytes record of alternative GGUF quantizations. Cache and total fields distinguish three modes:
+
+| Mode | `kvCacheBytes` / `totalBytes` | `kvCacheBytesByTp` / `totalBytesByTp` | Per-file cache |
+| --- | --- | --- | --- |
+| Cache enabled, TP omitted | Both `null` | Maps with all four keys `"1"`, `"2"`, `"4"`, `"8"` | `kvCache: null`; `kvCacheByTp` maps each TP to a full `KvCacheEstimate` |
+| Cache enabled, explicit TP | Single cache value and combined total | Both `null` | Single `kvCache`; `kvCacheByTp: null` |
+| Cache disabled | `kvCacheBytes: null`; weight/accessory total unchanged | Both `null` | Both `kvCache` and `kvCacheByTp` are `null` |
+
+For Safetensors or selected GGUF, each `kvCacheBytesByTp[tp]` is numeric. Each `totalBytesByTp[tp]` includes target weights, that TP's target cache, the selected `mmproj.bytes`, and the complete draft scenario (matching TP or its explicitly fixed TP). Read these combined totals rather than recomputing just target weights plus cache. No scalar TP 1 result is substituted for a comparison.
+
+For example, this **synthetic, abridged JSON** shows the comparison structure (other result fields and cache-detail fields are omitted):
+
+```json
+{
+  "weightsBytes": 4,
+  "kvCacheBytes": null,
+  "totalBytes": null,
+  "kvCacheBytesByTp": { "1": 512, "2": 1024, "4": 2048, "8": 4096 },
+  "totalBytesByTp": { "1": 516, "2": 1028, "4": 2052, "8": 4100 },
+  "files": {
+    "safetensors": {
+      "kvCache": null,
+      "kvCacheByTp": {
+        "1": { "bytes": 512, "tensorParallelSize": 1 },
+        "2": { "bytes": 1024, "tensorParallelSize": 2 },
+        "4": { "bytes": 2048, "tensorParallelSize": 4 },
+        "8": { "bytes": 4096, "tensorParallelSize": 8 }
+      }
+    }
+  }
+}
+```
+
+For **unselected GGUF**, each `kvCacheBytesByTp[tp]` is instead a filename-to-cache-bytes record, preserving both axes; for example, `"1": { "model-Q4.gguf": 512, "model-Q8.gguf": 512 }`. `totalBytesByTp` is `{ "1": null, "2": null, "4": null, "8": null }`, because quantization alternatives are never summed. Each `files[filename].kvCacheByTp` still contains all four full cache estimates. With explicit TP, the existing `kvCacheBytes` filename record is used instead and `totalBytes` is `null`.
+
+An unresolved draft GGUF selection also makes the corresponding combined totals `null`; target cache values, projector accounting, and the draft's own filename alternatives remain available. Select `ggufFile` / `--gguf-file` and, when needed, `draftModel.ggufFile` / `--draft-gguf-file` to obtain numeric combined totals. The `files` field retains parameter, component, and dtype breakdowns in every mode.
 
 `parameters` counts stored tensor elements, including packed tensors and auxiliary tensors; it is not necessarily the model's logical trainable parameter count. Safetensors bytes follow each stored dtype and shape. GGUF bytes use exact GGML block layouts, including quantization scales, and require block-aligned rows. Weight totals exclude file headers, alignment padding, and runtime allocations.
 
@@ -102,9 +153,9 @@ GGUF storage definitions follow [GGML's Python constants](https://github.com/ggm
 
 KV-cache estimation is opt-in with `kvCache: true` / `--kv-cache`. Safetensors configuration is read from `config.json`; GGUF configuration comes from embedded metadata. `auto` uses the configured Safetensors precision and falls back to F16 for GGUF.
 
-Each `files[name].kvCache` exposes `attentionBytes`, `indexerBytes` (included in attention), `stateBytes`, `convolutionBytes`, `recurrentBytes`, generic `layout`, `tensorParallelSize`, per-kind layer counts, storage dtypes, allocation policy, `approximate`, and `assumptions`. `bytes` and aggregate `kvCacheBytes` are **tensor payload**, not occupied engine-pool memory. They include attention and one persistent recurrent/convolution state per sequence (or the disclosed proxy when state geometry is incomplete). `approximate: true` identifies defaults, structural proxies, or packing assumptions; `false` still does not guarantee exact runtime memory. Inspect these fields through the library or CLI `--json`.
+Each `files[name].kvCache` (explicit TP) or `files[name].kvCacheByTp[tp]` (comparison) exposes `attentionBytes`, `indexerBytes` (included in attention), `stateBytes`, `convolutionBytes`, `recurrentBytes`, generic `layout`, `tensorParallelSize`, per-kind layer counts, storage dtypes, allocation policy, `approximate`, and `assumptions`. `bytes` and aggregate `kvCacheBytes` / `kvCacheBytesByTp[tp]` are **tensor payload**, not occupied engine-pool memory. They include attention and one persistent recurrent/convolution state per sequence (or the disclosed proxy when state geometry is incomplete). `approximate: true` identifies defaults, structural proxies, or packing assumptions; `false` still does not guarantee exact runtime memory. Inspect these fields through the library or CLI `--json`.
 
-The human-readable CLI report includes a separate **Cache assumptions** section with each target/draft file's layout, attention/state split, storage precisions and backend assumptions.
+The human-readable CLI report shows compact TP rows with target cache, draft cache when included (labeled when held at a fixed TP), and combined total. Its **Cache assumptions** section summarizes each target/draft file and deduplicates assumptions shared across TP alternatives; `--json` retains every full per-TP breakdown. Explicit TP keeps the detailed single-estimate report.
 
 ## Cache layouts and assumptions
 
@@ -113,11 +164,11 @@ The estimator is **metadata-driven, not an architecture registry**. `model_type`
 - **Dimensions and precision:** normalize nested text/decoder configurations and common aliases such as `n_layer`/`n_layers`, `n_embd`/`d_model`, `n_head`/`n_heads`, and nested `attn_config.kv_n_heads`. Prefer explicit KV heads and separate key/value dimensions, including per-layer and global geometry. MQA flags imply one KV head; otherwise missing KV heads use ordinary MHA. Missing query heads use the full hidden width. Fractional derived head dimensions round upward.
 - **Missing metadata:** context defaults to **4096 tokens** and precision to **F16**, both recorded as assumptions. Explicit options override these defaults. Invalid options, unsafe arithmetic, and configurations without enough layer/dimension information for a meaningful estimate still fail. No arbitrary model-size or layer-count defaults are invented.
 - **Unknown layouts:** unknown layer labels use a full-context attention proxy. Incomplete recurrent geometry uses the same attention-equivalent proxy rather than silently counting zero state. This can substantially overestimate recurrent memory; it is not a universal upper bound. Sharing hints assume independent buffers and warn about possible overestimation. Encoder-decoder configurations approximate an additional cross-attention cache using the requested context as source length.
-- **MLA capability fields:** `kv_lora_rank` and RoPE dimensions select shared compressed storage by default; `mlaLayout: "expanded"` / `--mla-layout expanded` uses separate query-head K/V projections. This does not depend on a DeepSeek/Kimi/GLM model name. Missing RoPE dimensions assume no extra RoPE key and mark the estimate approximate. Indexer-key dimensions add a per-token index vector approximation. For example, [DeepSeek-V3 metadata](https://huggingface.co/deepseek-ai/DeepSeek-V3/raw/main/config.json) yields **2,302,672,896 bytes** of compressed BF16 cache at 32,768 tokens.
+- **MLA capability fields:** `kv_lora_rank` and RoPE dimensions select shared compressed storage by default; `mlaLayout: "expanded"` / `--mla-layout expanded` uses separate query-head K/V projections. This does not depend on a DeepSeek/Kimi/GLM model name. Missing RoPE dimensions assume no extra RoPE key and mark the estimate approximate. Indexer-key dimensions add a per-token index vector approximation. For example, [DeepSeek-V3 metadata](https://huggingface.co/deepseek-ai/DeepSeek-V3/raw/main/config.json) yields **2,302,672,896 bytes** of compressed BF16 cache at 32,768 tokens and TP 1.
 - **Indexed attention:** `indexer_head_dim`, `indexer_kv_heads`, and `indexer_compress_ratio` (and canonical `index_*` equivalents) describe key-only caches, not query-head storage. Compressed metadata counts `ceil(context / ratio)` keys plus one raw group of `ratio` rows, without speculative or cached-position tails. `indexer_n_heads` is query-side and does not multiply persistent cache. The indexer byte total is reported separately within `attentionBytes`.
-- **Tensor parallelism:** `tensorParallelSize` / `--tensor-parallel-size` defaults to 1. Attention KV heads are divided into whole heads per rank; fewer KV heads than ranks require replication. Compressed MLA latents and single-head index keys are replicated across ranks. Linear recurrent head dimensions are sharded/rounded across ranks. Returned bytes sum all TP ranks, not one rank; data/pipeline/context parallelism, replicated auxiliary state and engine padding are not modeled. This assumes the usual vLLM-style cache distribution and does not validate every backend's topology restrictions.
+- **Tensor parallelism:** with cache enabled, high-level `estimateModelMemory` / CLI omission of `tensorParallelSize` / `--tensor-parallel-size` compares 1, 2, 4, and 8. An explicit TP requests just that estimate. The low-level `estimateSafetensorsKvCache` and `estimateGgufKvCache` remain single-estimate primitives and default to **TP 1**. Attention KV heads are divided into whole heads per rank; fewer KV heads than ranks require replication. Compressed MLA latents and single-head index keys are replicated across ranks. Linear recurrent head dimensions are sharded/rounded across ranks. Returned bytes sum all ranks **within one TP scenario**, never across alternative TPs; data/pipeline/context parallelism, replicated auxiliary state and engine padding are not modeled. This assumes the usual vLLM-style cache distribution and does not validate every backend's topology restrictions.
 - **Sliding windows:** explicit `layer_types`, `sliding_window_pattern`, and per-layer GGUF schedules select windowed/full layers. `slidingWindowPolicy: "optimized"` uses `min(context, window)`; `"full-context"` uses the full context. Missing window width uses full context with a warning. Short per-layer schedules repeat/truncate with a warning; numeric `max_window_layers` assumes the first layers are windowed. Transient prefill and boundary buffers are excluded.
-- **Recurrent capability fields:** complete `linear_*` dimensions imply convolution history and per-value-head key-by-value state matrices, regardless of model name. SSM fields (`state_size`/`d_state`, `intermediate_size`/`d_inner` or `hidden_size * expand`, `conv_kernel`/`d_conv`, optional groups) imply a generic SSM state/history estimate. Missing SSM expansion/history use 2 and 4 respectively with warnings. GGUF's overloaded state fields use this generic approximation, not a model-specific interpretation of `time_step_rank`. For [Qwen3.5-0.8B metadata](https://huggingface.co/Qwen/Qwen3.5-0.8B/raw/main/config.json), 32,768 tokens yield **402,653,184 attention bytes** plus **19,759,104 state bytes** under BF16 convolution / FP32 recurrent storage.
+- **Recurrent capability fields:** complete `linear_*` dimensions imply convolution history and per-value-head key-by-value state matrices, regardless of model name. SSM fields (`state_size`/`d_state`, `intermediate_size`/`d_inner` or `hidden_size * expand`, `conv_kernel`/`d_conv`, optional groups) imply a generic SSM state/history estimate. Missing SSM expansion/history use 2 and 4 respectively with warnings. GGUF's overloaded state fields use this generic approximation, not a model-specific interpretation of `time_step_rank`. For [Qwen3.5-0.8B metadata](https://huggingface.co/Qwen/Qwen3.5-0.8B/raw/main/config.json), 32,768 tokens at TP 1 yield **402,653,184 attention bytes** plus **19,759,104 state bytes** under BF16 convolution / FP32 recurrent storage.
 - **Quantized GGUF cache:** use the format's effective bits per element, including block scales, and round to whole bytes. Nonaligned rows and unfamiliar cache packing remain estimable; assumptions explicitly exclude exact backend padding and dtype support. Only attention storage is rescaled; recurrent state precision stays independent.
 
 `kvCacheDtype: "auto"` uses explicit cache precision first, then compute precision, then F16. Weight quantization never implies cache quantization. Conflicting recognized dtype declarations choose the wider storage width and mark the estimate approximate; unknown metadata precision falls back with a warning. Explicit invalid dtype options are still errors. GGUF auto uses explicit cache dtype metadata or F16.
@@ -130,7 +181,7 @@ These are resident payload estimates, not peak process RAM/VRAM. Defaults and st
 
 ## Interpreting an estimate
 
-`totalBytes` is the sum of counted resident weights, the requested cache estimate, and selected accessories. It is **not peak inference RAM/VRAM** or a guarantee that a model will fit. When cache estimation is disabled, cache memory is absent from the total, not zero in the running model.
+`totalBytes` (single estimate) or each `totalBytesByTp[tp]` (comparison) is the sum of counted resident weights, the requested cache estimate, and selected accessories including the complete draft scenario. It is **not peak inference RAM/VRAM** or a guarantee that a model will fit. When cache estimation is disabled, cache memory is absent from the total, not zero in the running model.
 
 The estimate excludes activations, prefill/decode workspaces, framework and allocator overhead, CUDA graphs, runtime weight conversion/repacking, device offloading, and distributed replication. Stored weight precision need not equal runtime precision. Use explicit cache settings where known and inspect `approximate` and `assumptions` before using a result for capacity planning.
 

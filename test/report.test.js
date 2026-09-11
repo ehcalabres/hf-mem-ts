@@ -14,6 +14,8 @@ test("shows Diffusers components as model sub-rows", () => {
     weightsBytes: 15 * 2 ** 30,
     kvCacheBytes: null,
     totalBytes: 15 * 2 ** 30,
+    kvCacheBytesByTp: null,
+    totalBytesByTp: null,
     files: {
       safetensors: {
         parameters: 0,
@@ -24,6 +26,7 @@ test("shows Diffusers components as model sub-rows", () => {
           transformer: { parameters: 0, bytes: 6 * 2 ** 30, dtypes: {} },
         },
         kvCache: null,
+        kvCacheByTp: null,
       },
     },
     mmproj: null,
@@ -42,11 +45,13 @@ test("identifies unresolved draft quantizations and their selection flag", () =>
   const output = formatResult({
     modelId: "org/target", revision: "main", format: "safetensors", filename: null,
     weightsBytes: 2 ** 30, kvCacheBytes: null, totalBytes: null, files: {}, mmproj: null,
+    kvCacheBytesByTp: null, totalBytesByTp: null,
     draft: {
       modelId: "org/draft", revision: "v2", format: "gguf", filename: null,
       weightsBytes: { "draft-Q4.gguf": 2 ** 30, "draft-Q8.gguf": 2 * 2 ** 30 },
       kvCacheBytes: { "draft-Q4.gguf": 0.5 * 2 ** 30, "draft-Q8.gguf": 0.5 * 2 ** 30 },
       totalBytes: null, files: {}, mmproj: null, draft: null,
+      kvCacheBytesByTp: null, totalBytesByTp: null,
     },
   });
   assert.match(output, /Draft model:\s+org\/draft@v2/);
@@ -61,6 +66,7 @@ test("keeps alternatives separate and identifies both unresolved selections", ()
     modelId: "org/target", revision: "main", format: "gguf", filename: null,
     weightsBytes: { "Q4.gguf": 2 ** 30, "Q8.gguf": 2 * 2 ** 30 },
     kvCacheBytes: null, totalBytes: null, files: {}, mmproj: null, draft: null,
+    kvCacheBytesByTp: null, totalBytesByTp: null,
   };
   const output = formatResult({ ...alternative, draft: { ...alternative, modelId: "org/draft" } });
   assert.match(output, /Total:.*--gguf-file for the target.*--draft-gguf-file for the draft/);
@@ -71,14 +77,16 @@ test("shows cache assumptions and preserves separate accessory costs", () => {
   const output = formatResult({
     modelId: "org/target", revision: "main", format: "gguf", filename: "model.gguf",
     weightsBytes: 2 ** 30, kvCacheBytes: 0.5 * 2 ** 30, totalBytes: 3.75 * 2 ** 30,
+    kvCacheBytesByTp: null, totalBytesByTp: null,
     files: { "model.gguf": { components: {}, kvCache: estimateGgufKvCache({
       "llama.block_count": 16, "llama.attention.head_count_kv": 8,
       "llama.attention.head_count": 32, "llama.embedding_length": 4096, "llama.context_length": 4096,
-    }, { batchSize: 2 }) } },
+    }, { batchSize: 2 }), kvCacheByTp: null } },
     mmproj: { filename: "mmproj.gguf", bytes: 0.25 * 2 ** 30 },
     draft: {
       modelId: "org/draft", revision: "main", format: "safetensors", filename: null,
       weightsBytes: 2 ** 30, kvCacheBytes: 2 ** 30, totalBytes: 2 * 2 ** 30,
+      kvCacheBytesByTp: null, totalBytesByTp: null,
       files: {}, mmproj: null, draft: null,
     },
   });

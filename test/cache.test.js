@@ -203,14 +203,16 @@ test("GGUF noncausal, shared-cache and incomplete window metadata remain estimab
 test("reports actual target and draft cache layouts, state sizes and independent storage policies", () => {
   const cache = estimateSafetensorsKvCache(qwen35, { maxModelLen: 32768 });
   const draftCache = estimateSafetensorsKvCache(qwen35, { maxModelLen: 32768, recurrentStateDtype: "bfloat16" });
-  const file = { parameters: 0, bytes: 0, components: {}, kvCache: cache };
+  const file = { parameters: 0, bytes: 0, components: {}, kvCache: cache, kvCacheByTp: null };
   const result = {
     modelId: "Qwen/Qwen3.5-0.8B", revision: "main", format: "safetensors", filename: null,
     weightsBytes: 0, kvCacheBytes: cache.bytes, totalBytes: cache.bytes + draftCache.bytes,
+    kvCacheBytesByTp: null, totalBytesByTp: null,
     files: { safetensors: file }, mmproj: null,
     draft: {
       modelId: "Qwen/Qwen3.5-0.8B", revision: "main", format: "safetensors", filename: null,
       weightsBytes: 0, kvCacheBytes: draftCache.bytes, totalBytes: draftCache.bytes,
+      kvCacheBytesByTp: null, totalBytesByTp: null,
       files: { safetensors: { ...file, kvCache: draftCache } }, mmproj: null, draft: null,
     },
   };

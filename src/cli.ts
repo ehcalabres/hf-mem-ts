@@ -29,7 +29,7 @@ Options:
       --request-timeout-ms <n> Request deadline in ms, including retries/body (1-2147483647; default: 30000)
       --max-retries <n>     Transient request retries (0-10; default: 2; 0 disables)
       --kv-cache-dtype <d>  KV dtype (default: auto; GGUF auto is F16)
-      --tensor-parallel-size <n> Cache payload across TP ranks (default: 1; excludes pool padding)
+      --tensor-parallel-size <n> Cache payload across TP ranks (with --kv-cache, default: compare 1, 2, 4, 8; excludes pool padding)
       --sliding-window-policy <p> optimized (default) or full-context allocation
       --mla-layout <layout> compressed (default) or expanded MLA cache
       --recurrent-state-dtype <d> Recurrent storage precision override

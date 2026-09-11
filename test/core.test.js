@@ -101,8 +101,12 @@ test("estimates a Hub Safetensors model through an injected fetch", async () => 
   const result = await estimateModelMemory({ modelId: "org/model", fetch: fetcher, kvCache: true });
   assert.equal(result.format, "safetensors");
   assert.equal(result.weightsBytes, 200);
-  assert.equal(result.kvCacheBytes, 1024);
-  assert.equal(result.totalBytes, 1224);
+  assert.equal(result.kvCacheBytes, null);
+  assert.equal(result.totalBytes, null);
+  assert.deepEqual(result.kvCacheBytesByTp, { "1": 1024, "2": 1024, "4": 2048, "8": 4096 });
+  assert.deepEqual(result.totalBytesByTp, { "1": 1224, "2": 1224, "4": 2248, "8": 4296 });
+  assert.equal(result.files.safetensors.kvCache, null);
+  assert.deepEqual(Object.keys(result.files.safetensors.kvCacheByTp), ["1", "2", "4", "8"]);
 });
 
 test("keeps embedded GGUF metadata internal to the parser", async () => {

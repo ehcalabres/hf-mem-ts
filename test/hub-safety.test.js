@@ -37,7 +37,7 @@ function repository(files, onResolve) {
 
 test("padded first shard supplies the sole KV cache and projector bytes are additive", async () => {
   const result = await estimateModelMemory({
-    modelId: "org/model", ggufFile: "model-00002-of-00002.gguf", kvCache: true,
+    modelId: "org/model", ggufFile: "model-00002-of-00002.gguf", kvCache: true, tensorParallelSize: 1,
     fetch: repository(["model-00002-of-00002.gguf", "model-00001-of-00002.gguf", "mmproj_f16.gguf"]),
   });
   assert.equal(result.filename, "model.gguf");
