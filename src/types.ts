@@ -1,29 +1,67 @@
 export interface DtypeStats {
+  /** Stored tensor elements, not necessarily logical model parameters for packed weights. */
   parameters: number;
   bytes: number;
 }
 
 export interface ComponentStats {
+  /** Stored tensor elements, not necessarily logical model parameters for packed weights. */
   parameters: number;
   bytes: number;
   dtypes: Record<string, DtypeStats>;
 }
 
 export interface WeightMetadata {
+  /** Stored tensor elements, not necessarily logical model parameters for packed weights. */
   parameters: number;
   bytes: number;
   components: Record<string, ComponentStats>;
 }
 
 export interface KvCacheEstimate {
+  /** Aggregate cache tensor payload, not occupied backend pool bytes; excludes checkpoint/page overhead. */
   bytes: number;
   dtype: string;
   maxModelLen: number;
   batchSize: number;
+  /** Aggregate cache payload across these tensor-parallel ranks; defaults to one rank. */
+  tensorParallelSize: number;
+  attentionBytes: number;
+  /** Indexer keys and raw compression history, included in attentionBytes. */
+  indexerBytes: number;
+  stateBytes: number;
+  convolutionBytes: number;
+  recurrentBytes: number;
+  convolutionDtype: string | null;
+  recurrentDtype: string | null;
+  layout: "attention" | "mla-compressed" | "mla-expanded" | "hybrid" | "recurrent";
+  /** True when defaults, structural proxies, or packing approximations were needed; see assumptions. */
+  approximate: boolean;
+  slidingWindowPolicy: "optimized" | "full-context";
+  fullAttentionLayers: number;
+  slidingAttentionLayers: number;
+  recurrentLayers: number;
+  assumptions: string[];
+}
+
+export interface KvCacheOptions {
+  maxModelLen?: number;
+  batchSize?: number;
+  dtype?: string;
+  /** KV heads are sharded across ranks, with whole-head replication when necessary. */
+  tensorParallelSize?: number;
+  /** Backend allocation policy, not the attention mask. Defaults to optimized. */
+  slidingWindowPolicy?: "optimized" | "full-context";
+  /** MLA storage choice. Defaults to compressed (latent plus shared RoPE key). */
+  mlaLayout?: "compressed" | "expanded";
+  /** Recurrent storage precision; config mamba_ssm_dtype/state_dtype or F32 if omitted. */
+  recurrentStateDtype?: string;
 }
 
 export interface FileEstimate extends WeightMetadata {
   kvCache: KvCacheEstimate | null;
+  /** Full cache breakdowns for TP=1,2,4,8 when no TP was selected; otherwise null. */
+  kvCacheByTp: Record<string, KvCacheEstimate> | null;
 }
 
 export interface MmprojEstimate extends WeightMetadata {
@@ -44,8 +82,12 @@ export interface EstimateResult {
   filename: string | null;
   weightsBytes: number | Record<string, number>;
   kvCacheBytes: number | Record<string, number> | null;
-  /** Null when the result contains multiple alternative GGUF quantizations. */
+  /** Default TP comparison: TP -> bytes, or TP -> GGUF filename -> bytes. Otherwise null. */
+  kvCacheBytesByTp: Record<string, number | Record<string, number>> | null;
+  /** Null for unresolved GGUF quantization or an active TP comparison. */
   totalBytes: number | null;
+  /** Per-TP target + projector + draft totals; null values require a GGUF selection. */
+  totalBytesByTp: Record<string, number | null> | null;
   files: Record<string, FileEstimate>;
   /** Multimodal projector loaded alongside a GGUF model, if present and enabled. */
   mmproj: MmprojEstimate | null;
@@ -62,6 +104,10 @@ export interface DraftModelOptions {
   maxModelLen?: number;
   batchSize?: number;
   kvCacheDtype?: string;
+  tensorParallelSize?: number;
+  slidingWindowPolicy?: "optimized" | "full-context";
+  mlaLayout?: "compressed" | "expanded";
+  recurrentStateDtype?: string;
 }
 
 export interface EstimateOptions {
@@ -83,6 +129,14 @@ export interface EstimateOptions {
   batchSize?: number;
   /** Safetensors aliases (auto, bfloat16, fp8...) or a GGUF dtype (F16, Q8_0...). */
   kvCacheDtype?: string;
+  /** Aggregate cache payload for one TP size. Omit to compare TP=1,2,4,8 when kvCache is enabled. */
+  tensorParallelSize?: number;
+  /** Allocate window-limited attention caches or full context per attention layer. */
+  slidingWindowPolicy?: "optimized" | "full-context";
+  /** MLA backend storage layout; defaults to compressed, not universal across engines. */
+  mlaLayout?: "compressed" | "expanded";
+  /** Override recurrent state storage dtype to match the backend. */
+  recurrentStateDtype?: string;
   /** Override fetch, useful for SSR, tests, proxies, or non-browser runtimes. */
   fetch?: FetchLike;
   /** Cancel target and draft requests, body reads, queued work, and retry delays. */

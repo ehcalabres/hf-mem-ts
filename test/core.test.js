@@ -73,7 +73,11 @@ test("fetches only the two Safetensors metadata ranges", async () => {
 test("computes GQA KV cache and parses GGUF tensor metadata", () => {
   const config = { hidden_size: 4096, num_hidden_layers: 32, num_attention_heads: 32, num_key_value_heads: 8, max_position_embeddings: 4096, torch_dtype: "bfloat16" };
   const cache = estimateSafetensorsKvCache(config);
-  assert.deepEqual(cache, { bytes: 536_870_912, dtype: "BF16", maxModelLen: 4096, batchSize: 1 });
+  assert.equal(cache.bytes, 536_870_912);
+  assert.equal(cache.attentionBytes, 536_870_912);
+  assert.equal(cache.stateBytes, 0);
+  assert.equal(cache.dtype, "BF16");
+  assert.equal(cache.layout, "attention");
 
   const parsed = parseGguf(ggufFile());
   assert.equal(parsed.parameters, 4096 ** 2);
@@ -97,8 +101,12 @@ test("estimates a Hub Safetensors model through an injected fetch", async () => 
   const result = await estimateModelMemory({ modelId: "org/model", fetch: fetcher, kvCache: true });
   assert.equal(result.format, "safetensors");
   assert.equal(result.weightsBytes, 200);
-  assert.equal(result.kvCacheBytes, 1024);
-  assert.equal(result.totalBytes, 1224);
+  assert.equal(result.kvCacheBytes, null);
+  assert.equal(result.totalBytes, null);
+  assert.deepEqual(result.kvCacheBytesByTp, { "1": 1024, "2": 1024, "4": 2048, "8": 4096 });
+  assert.deepEqual(result.totalBytesByTp, { "1": 1224, "2": 1224, "4": 2248, "8": 4296 });
+  assert.equal(result.files.safetensors.kvCache, null);
+  assert.deepEqual(Object.keys(result.files.safetensors.kvCacheByTp), ["1", "2", "4", "8"]);
 });
 
 test("keeps embedded GGUF metadata internal to the parser", async () => {

@@ -2,13 +2,15 @@ import { fetchGgufMetadata, estimateGgufKvCache } from "./gguf.js";
 import { assertPositiveInteger, checkedFetch, fetchJson, mapLimit, readJson } from "./http.js";
 import { estimateSafetensorsKvCache } from "./kv-cache.js";
 import { fetchSafetensorsHeader, parseSafetensorsHeaders } from "./safetensors.js";
-import type { DraftModelOptions, EstimateOptions, EstimateResult, FileEstimate, FetchLike, HubFile, MmprojEstimate, WeightMetadata } from "./types.js";
+import type { DraftModelOptions, EstimateOptions, EstimateResult, FileEstimate, FetchLike, HubFile, KvCacheEstimate, KvCacheOptions, MmprojEstimate, WeightMetadata } from "./types.js";
 import { requestPolicy, transportFetch, type RequestPolicy } from "./transport.js";
 
 type ModelOptions = Required<Pick<EstimateOptions, "modelId" | "revision" | "batchSize" | "concurrency" | "hubUrl">>
   & EstimateOptions & { requestedRevision: string };
 
 const SHARD = /(.+)-(\d+)-of-(\d+)\.gguf$/i;
+const DEFAULT_TENSOR_PARALLEL_SIZES = [1, 2, 4, 8] as const;
+type FileCache = Pick<FileEstimate, "kvCache" | "kvCacheByTp">;
 
 function urlPath(path: string): string { return path.split("/").map(encodeURIComponent).join("/"); }
 
@@ -45,12 +47,71 @@ function resolveUrl(hub: string, modelId: string, revision: string, path: string
   return `${hub}/${urlPath(modelId)}/resolve/${encodeURIComponent(revision)}/${urlPath(path)}`;
 }
 
-function emptyFile(metadata: WeightMetadata, kvCache: FileEstimate["kvCache"]): FileEstimate {
+function emptyFile(metadata: WeightMetadata, cache: FileCache): FileEstimate {
   return {
     parameters: metadata.parameters,
     bytes: metadata.bytes,
     components: metadata.components,
-    kvCache,
+    ...cache,
+  };
+}
+
+function estimateCaches(options: ModelOptions, estimate: (options: KvCacheOptions) => KvCacheEstimate): FileCache {
+  const cacheOptions: KvCacheOptions = {
+    batchSize: options.batchSize,
+    ...(options.maxModelLen !== undefined ? { maxModelLen: options.maxModelLen } : {}),
+    ...(options.kvCacheDtype !== undefined ? { dtype: options.kvCacheDtype } : {}),
+    ...(options.slidingWindowPolicy !== undefined ? { slidingWindowPolicy: options.slidingWindowPolicy } : {}),
+    ...(options.mlaLayout !== undefined ? { mlaLayout: options.mlaLayout } : {}),
+    ...(options.recurrentStateDtype !== undefined ? { recurrentStateDtype: options.recurrentStateDtype } : {}),
+  };
+  if (options.tensorParallelSize !== undefined) {
+    return {
+      kvCache: estimate({ ...cacheOptions, tensorParallelSize: options.tensorParallelSize }),
+      kvCacheByTp: null,
+    };
+  }
+  return {
+    kvCache: null,
+    kvCacheByTp: Object.fromEntries(DEFAULT_TENSOR_PARALLEL_SIZES.map((tensorParallelSize) => [
+      String(tensorParallelSize), estimate({ ...cacheOptions, tensorParallelSize }),
+    ])),
+  };
+}
+
+function checkedTotal(...values: number[]): number {
+  let total = 0;
+  for (const value of values) {
+    total += value;
+    if (!Number.isSafeInteger(total) || total < 0) throw new RangeError("Total model memory exceeds JavaScript's safe integer range.");
+  }
+  return total;
+}
+
+function memoryTotals(
+  files: Record<string, FileEstimate>,
+  selectedName: string | null,
+): Pick<EstimateResult, "kvCacheBytes" | "kvCacheBytesByTp" | "totalBytes" | "totalBytesByTp"> {
+  const selected = selectedName === null ? null : files[selectedName]!;
+  const entries = Object.entries(files);
+  const comparing = entries.some(([, file]) => file.kvCacheByTp !== null);
+  if (comparing) {
+    const kvCacheBytesByTp = Object.fromEntries(DEFAULT_TENSOR_PARALLEL_SIZES.map((tp) => [
+      String(tp),
+      selected ? selected.kvCacheByTp![tp]!.bytes
+        : Object.fromEntries(entries.map(([name, file]) => [name, file.kvCacheByTp![tp]!.bytes])),
+    ]));
+    const totalBytesByTp = Object.fromEntries(DEFAULT_TENSOR_PARALLEL_SIZES.map((tp) => [
+      String(tp), selected ? checkedTotal(selected.bytes, selected.kvCacheByTp![tp]!.bytes) : null,
+    ]));
+    return { kvCacheBytes: null, kvCacheBytesByTp, totalBytes: null, totalBytesByTp };
+  }
+  const caches = Object.fromEntries(entries.filter(([, file]) => file.kvCache !== null).map(([name, file]) => [name, file.kvCache!.bytes]));
+  return {
+    kvCacheBytes: selected ? selected.kvCache?.bytes ?? null : Object.keys(caches).length ? caches : null,
+    kvCacheBytesByTp: null,
+    totalBytes: selected ? checkedTotal(selected.bytes, selected.kvCache?.bytes ?? 0) : null,
+    totalBytesByTp: null,
   };
 }
 
@@ -134,21 +195,16 @@ async function estimateSafetensors(
     }
     metadata.components[component] = current;
   }
-  let kvCache = null;
+  let cache: FileCache = { kvCache: null, kvCacheByTp: null };
   if (options.kvCache) {
     if (!files.includes("config.json")) throw new Error("KV-cache estimation requested, but config.json was not found.");
     const config = await fetchJson<Record<string, unknown>>(fetcher, resolveUrl(options.hubUrl, options.modelId, options.revision, "config.json"), headers);
-    kvCache = estimateSafetensorsKvCache(config, {
-      batchSize: options.batchSize,
-      metadata,
-      ...(options.maxModelLen !== undefined ? { maxModelLen: options.maxModelLen } : {}),
-      ...(options.kvCacheDtype !== undefined ? { dtype: options.kvCacheDtype } : {}),
-    });
+    cache = estimateCaches(options, (cacheOptions) => estimateSafetensorsKvCache(config, cacheOptions));
   }
+  const estimates = { safetensors: emptyFile(metadata, cache) };
   return {
     modelId: options.modelId, revision: options.requestedRevision, resolvedRevision: options.revision, format: "safetensors", filename: null,
-    weightsBytes: metadata.bytes, kvCacheBytes: kvCache?.bytes ?? null,
-    totalBytes: metadata.bytes + (kvCache?.bytes ?? 0), files: { safetensors: emptyFile(metadata, kvCache) },
+    weightsBytes: metadata.bytes, ...memoryTotals(estimates, "safetensors"), files: estimates,
     mmproj: null, draft: null,
   };
 }
@@ -169,7 +225,10 @@ function mergeMetadata(target: FileEstimate | undefined, next: FileEstimate): Fi
     }
     current.parameters += component.parameters; current.bytes += component.bytes; components[name] = current;
   }
-  return { parameters, bytes, components, kvCache: target.kvCache ?? next.kvCache };
+  return {
+    parameters, bytes, components, kvCache: target.kvCache ?? next.kvCache,
+    kvCacheByTp: target.kvCacheByTp ?? next.kvCacheByTp,
+  };
 }
 
 function isMmproj(path: string): boolean {
@@ -220,24 +279,20 @@ async function estimateGguf(
     const shard = path.match(SHARD);
     const group = shard ? `${shard[1]}.gguf` : path;
     const shouldComputeKv = Boolean(options.kvCache && (!shard || Number(shard[2]) === 1));
-    const kv = shouldComputeKv ? estimateGgufKvCache(metadata.metadata, {
-      batchSize: options.batchSize,
-      ...(options.maxModelLen !== undefined ? { maxModelLen: options.maxModelLen } : {}),
-      ...(options.kvCacheDtype !== undefined ? { dtype: options.kvCacheDtype } : {}),
-    }) : null;
-    return { group, estimate: emptyFile(metadata, kv) };
+    const cache = shouldComputeKv
+      ? estimateCaches(options, (cacheOptions) => estimateGgufKvCache(metadata.metadata, cacheOptions))
+      : { kvCache: null, kvCacheByTp: null };
+    return { group, estimate: emptyFile(metadata, cache) };
   });
   const grouped: Record<string, FileEstimate> = {};
   for (const item of parsed) grouped[item.group] = mergeMetadata(grouped[item.group], item.estimate);
   const names = Object.keys(grouped);
   const selected = options.ggufFile ? grouped[names[0]!]! : null;
   const weights = Object.fromEntries(names.map((name) => [name, grouped[name]!.bytes]));
-  const caches = Object.fromEntries(names.filter((name) => grouped[name]!.kvCache).map((name) => [name, grouped[name]!.kvCache!.bytes]));
   return {
     modelId: options.modelId, revision: options.requestedRevision, resolvedRevision: options.revision, format: "gguf", filename: options.ggufFile ? names[0]! : null,
     weightsBytes: selected ? selected.bytes : weights,
-    kvCacheBytes: selected ? selected.kvCache?.bytes ?? null : Object.keys(caches).length ? caches : null,
-    totalBytes: selected ? selected.bytes + (selected.kvCache?.bytes ?? 0) : null, files: grouped,
+    ...memoryTotals(grouped, options.ggufFile ? names[0]! : null), files: grouped,
     mmproj: null, draft: null,
   };
 }
@@ -290,6 +345,10 @@ function draftOptions(input: EstimateOptions, draft: string | DraftModelOptions)
     ...((selected.maxModelLen ?? input.maxModelLen) !== undefined ? { maxModelLen: selected.maxModelLen ?? input.maxModelLen } : {}),
     ...((selected.batchSize ?? input.batchSize) !== undefined ? { batchSize: selected.batchSize ?? input.batchSize } : {}),
     ...((selected.kvCacheDtype ?? input.kvCacheDtype) !== undefined ? { kvCacheDtype: selected.kvCacheDtype ?? input.kvCacheDtype } : {}),
+    ...((selected.tensorParallelSize ?? input.tensorParallelSize) !== undefined ? { tensorParallelSize: selected.tensorParallelSize ?? input.tensorParallelSize } : {}),
+    ...((selected.slidingWindowPolicy ?? input.slidingWindowPolicy) !== undefined ? { slidingWindowPolicy: selected.slidingWindowPolicy ?? input.slidingWindowPolicy } : {}),
+    ...((selected.mlaLayout ?? input.mlaLayout) !== undefined ? { mlaLayout: selected.mlaLayout ?? input.mlaLayout } : {}),
+    ...((selected.recurrentStateDtype ?? input.recurrentStateDtype) !== undefined ? { recurrentStateDtype: selected.recurrentStateDtype ?? input.recurrentStateDtype } : {}),
     ...(selected.ggufFile !== undefined ? { ggufFile: selected.ggufFile } : {}),
   };
 }
@@ -300,22 +359,43 @@ function draftMatchesTarget(
 ): boolean {
   if (!input.draftModel) return false;
   const draft = typeof input.draftModel === "string" ? { modelId: input.draftModel } : input.draftModel;
+  const draftTp = draft.tensorParallelSize ?? options.tensorParallelSize;
+  const sameTopology = draftTp === options.tensorParallelSize;
+  const canSelectComparison = Boolean(options.kvCache && options.tensorParallelSize === undefined
+    && DEFAULT_TENSOR_PARALLEL_SIZES.some((tp) => tp === draftTp));
   return draft.modelId === options.modelId
     && (draft.revision ?? "main") === options.revision
     && draft.ggufFile === input.ggufFile
     && (draft.maxModelLen ?? options.maxModelLen) === options.maxModelLen
     && (draft.batchSize ?? options.batchSize) === options.batchSize
-    && (draft.kvCacheDtype ?? options.kvCacheDtype) === options.kvCacheDtype;
+    && (draft.kvCacheDtype ?? options.kvCacheDtype) === options.kvCacheDtype
+    && (sameTopology || canSelectComparison)
+    && (draft.slidingWindowPolicy ?? options.slidingWindowPolicy) === options.slidingWindowPolicy
+    && (draft.mlaLayout ?? options.mlaLayout) === options.mlaLayout
+    && (draft.recurrentStateDtype ?? options.recurrentStateDtype) === options.recurrentStateDtype;
+}
+
+function selectTopology(base: EstimateResult, tp: number): EstimateResult {
+  const files = Object.fromEntries(Object.entries(base.files).map(([name, file]) => {
+    const kvCache = file.kvCacheByTp?.[tp];
+    if (!kvCache) throw new Error(`Missing TP=${tp} cache comparison for ${name}.`);
+    return [name, { ...file, kvCache, kvCacheByTp: null }];
+  }));
+  return { ...base, files, ...memoryTotals(files, base.format === "safetensors" ? "safetensors" : base.filename) };
 }
 
 function withAccessories(base: EstimateResult, mmproj: MmprojEstimate | null, draft: EstimateResult | null): EstimateResult {
   const totalBytes = base.totalBytes === null || draft?.totalBytes === null
     ? null
-    : base.totalBytes + (mmproj?.bytes ?? 0) + (draft?.totalBytes ?? 0);
-  if (totalBytes !== null && !Number.isSafeInteger(totalBytes)) {
-    throw new RangeError("Total model memory exceeds JavaScript's safe integer range.");
-  }
-  return { ...base, totalBytes, mmproj, draft };
+    : checkedTotal(base.totalBytes, mmproj?.bytes ?? 0, draft?.totalBytes ?? 0);
+  const comparison = base.totalBytesByTp ?? draft?.totalBytesByTp;
+  const totalBytesByTp = comparison ? Object.fromEntries(Object.keys(comparison).map((tp) => {
+    const targetTotal = base.totalBytesByTp ? base.totalBytesByTp[tp]! : base.totalBytes;
+    const draftTotal = draft ? (draft.totalBytesByTp ? draft.totalBytesByTp[tp]! : draft.totalBytes) : 0;
+    return [tp, targetTotal === null || draftTotal === null
+      ? null : checkedTotal(targetTotal, mmproj?.bytes ?? 0, draftTotal)];
+  })) : null;
+  return { ...base, totalBytes, totalBytesByTp, mmproj, draft };
 }
 
 export async function estimateModelMemory(input: EstimateOptions): Promise<EstimateResult> {
@@ -333,6 +413,9 @@ async function estimateModel(input: EstimateOptions, rawFetch: FetchLike, policy
   assertPositiveInteger(options.batchSize, "batchSize");
   assertPositiveInteger(options.concurrency, "concurrency");
   if (options.maxModelLen !== undefined) assertPositiveInteger(options.maxModelLen, "maxModelLen");
+  if (options.tensorParallelSize !== undefined) assertPositiveInteger(options.tensorParallelSize, "tensorParallelSize");
+  const draftInput = input.draftModel ? draftOptions(input, input.draftModel) : null;
+  if (draftInput?.tensorParallelSize !== undefined) assertPositiveInteger(draftInput.tensorParallelSize, "draft tensorParallelSize");
   const fetcher = transportFetch(rawFetch, options.concurrency, policy);
   const headers = requestHeaders(options.token);
   const targetPromise = (async () => {
@@ -357,9 +440,12 @@ async function estimateModel(input: EstimateOptions, rawFetch: FetchLike, policy
     return { base, mmproj };
   })();
   const draftPromise = draftMatchesTarget(input, options)
-    ? targetPromise.then(({ base }) => base)
-    : input.draftModel
-      ? estimateModel(draftOptions(input, input.draftModel), rawFetch, policy)
+    ? targetPromise.then(({ base }) => {
+      const draftTp = typeof input.draftModel === "object" ? input.draftModel.tensorParallelSize : undefined;
+      return base.kvCacheBytesByTp && draftTp !== undefined ? selectTopology(base, draftTp) : base;
+    })
+    : draftInput
+      ? estimateModel(draftInput, rawFetch, policy)
       : Promise.resolve(null);
   const [{ base, mmproj }, draft] = await Promise.all([targetPromise, draftPromise]);
   return withAccessories(base, mmproj, draft);

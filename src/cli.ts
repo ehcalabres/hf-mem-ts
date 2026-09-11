@@ -29,6 +29,10 @@ Options:
       --request-timeout-ms <n> Request deadline in ms, including retries/body (1-2147483647; default: 30000)
       --max-retries <n>     Transient request retries (0-10; default: 2; 0 disables)
       --kv-cache-dtype <d>  KV dtype (default: auto; GGUF auto is F16)
+      --tensor-parallel-size <n> Cache payload across TP ranks (with --kv-cache, default: compare 1, 2, 4, 8; excludes pool padding)
+      --sliding-window-policy <p> optimized (default) or full-context allocation
+      --mla-layout <layout> compressed (default) or expanded MLA cache
+      --recurrent-state-dtype <d> Recurrent storage precision override
       --token <token>       Hugging Face token (or use HF_TOKEN)
       --json                Print machine-readable JSON
   -h, --help                Show help
@@ -50,6 +54,10 @@ interface Args {
   requestTimeoutMs?: number;
   maxRetries?: number;
   kvCacheDtype?: string;
+  tensorParallelSize?: number;
+  slidingWindowPolicy?: "optimized" | "full-context";
+  mlaLayout?: "compressed" | "expanded";
+  recurrentStateDtype?: string;
   token?: string;
   json?: boolean;
   help?: boolean;
@@ -89,6 +97,20 @@ function parseArgs(argv: string[]): Args {
       case "--request-timeout-ms": args.requestTimeoutMs = parseInteger(take(i++, value), value); break;
       case "--max-retries": args.maxRetries = parseInteger(take(i++, value), value, 0); break;
       case "--kv-cache-dtype": args.kvCacheDtype = take(i++, value); break;
+      case "--tensor-parallel-size": args.tensorParallelSize = parseInteger(take(i++, value), value); break;
+      case "--sliding-window-policy": {
+        const policy = take(i++, value);
+        if (policy !== "optimized" && policy !== "full-context") throw new Error("--sliding-window-policy requires optimized or full-context.");
+        args.slidingWindowPolicy = policy;
+        break;
+      }
+      case "--mla-layout": {
+        const layout = take(i++, value);
+        if (layout !== "compressed" && layout !== "expanded") throw new Error("--mla-layout requires compressed or expanded.");
+        args.mlaLayout = layout;
+        break;
+      }
+      case "--recurrent-state-dtype": args.recurrentStateDtype = take(i++, value); break;
       case "--token": args.token = take(i++, value); break;
       case "--json": args.json = true; break;
       case "-h": case "--help": args.help = true; break;
@@ -126,6 +148,10 @@ async function main(): Promise<void> {
     ...(args.requestTimeoutMs !== undefined ? { requestTimeoutMs: args.requestTimeoutMs } : {}),
     ...(args.maxRetries !== undefined ? { maxRetries: args.maxRetries } : {}),
     ...(args.kvCacheDtype ? { kvCacheDtype: args.kvCacheDtype } : {}),
+    ...(args.tensorParallelSize !== undefined ? { tensorParallelSize: args.tensorParallelSize } : {}),
+    ...(args.slidingWindowPolicy ? { slidingWindowPolicy: args.slidingWindowPolicy } : {}),
+    ...(args.mlaLayout ? { mlaLayout: args.mlaLayout } : {}),
+    ...(args.recurrentStateDtype ? { recurrentStateDtype: args.recurrentStateDtype } : {}),
     ...(token ? { token } : {}),
   });
   if (args.json) console.log(JSON.stringify(result, null, 2));

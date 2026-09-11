@@ -21,8 +21,12 @@ function invoke(args, options = {}, timeout = 10_000) {
         return new Response('temporarily unavailable', { status: 503, headers: { 'Retry-After': '0' } });
       }
       const url = String(input);
-      if (url.includes('/tree/')) return Response.json([{ type: 'file', path: 'model.safetensors' }]);
+      if (url.includes('/tree/')) return Response.json([
+        { type: 'file', path: 'model.safetensors' },
+        ...(process.env.TEST_CACHE_CONFIG ? [{ type: 'file', path: 'config.json' }] : []),
+      ]);
       if (url.includes('/api/models/')) return Response.json({ sha: 'a'.repeat(40) });
+      if (url.endsWith('config.json')) return Response.json(JSON.parse(process.env.TEST_CACHE_CONFIG));
       const range = new Headers(init.headers).get('range').match(/bytes=(\\d+)-(\\d+)/);
       if (!range) throw Error('Expected a range request');
       const start = Number(range[1]); const end = Math.min(Number(range[2]), file.length - 1);
@@ -48,6 +52,9 @@ test("CLI prints valid JSON and honors explicit authentication over HF_TOKEN", (
     const result = JSON.parse(child.stdout);
     assert.equal(result.weightsBytes, 4);
     assert.equal(result.totalBytes, 4);
+    assert.equal(result.kvCacheBytes, null);
+    assert.equal(result.kvCacheBytesByTp, null);
+    assert.equal(result.totalBytesByTp, null);
   }
 });
 
@@ -105,4 +112,69 @@ test("CLI rejects out-of-range request policies before making network requests",
     assert.match(child.stderr, error);
     assert.doesNotMatch(child.stderr, /401/);
   }
+});
+
+test("CLI tensor parallelism changes aggregate KV payload and is inherited by the draft", () => {
+  const config = JSON.stringify({
+    hidden_size: 32, num_hidden_layers: 2, num_attention_heads: 8, num_key_value_heads: 1,
+    max_position_embeddings: 16, dtype: "float16",
+  });
+  const child = invoke(["org/model", "--kv-cache", "--tensor-parallel-size", "4", "--draft-model", "org/draft", "--json"], { TEST_CACHE_CONFIG: config });
+  assert.equal(child.status, 0, child.stderr);
+  const result = JSON.parse(child.stdout);
+  assert.equal(result.kvCacheBytes, 2048);
+  assert.equal(result.draft.kvCacheBytes, 2048);
+  assert.equal(result.totalBytes, 4104);
+  assert.equal(result.kvCacheBytesByTp, null);
+  assert.equal(result.totalBytesByTp, null);
+  assert.equal(result.files.safetensors.kvCacheByTp, null);
+  assert.equal(result.draft.kvCacheBytesByTp, null);
+  assert.equal(result.draft.totalBytesByTp, null);
+});
+
+test("CLI default cache JSON exposes all TP alternatives without choosing a scalar total", () => {
+  const child = invoke(["org/model", "--kv-cache", "--json"], {
+    TEST_CACHE_CONFIG: JSON.stringify({
+      hidden_size: 32, num_hidden_layers: 2, num_attention_heads: 8, num_key_value_heads: 1,
+      max_position_embeddings: 16, dtype: "float16",
+    }),
+  });
+  assert.equal(child.status, 0, child.stderr);
+  assert.equal(child.stderr, "");
+  const result = JSON.parse(child.stdout);
+  assert.equal(result.weightsBytes, 4);
+  assert.equal(result.kvCacheBytes, null);
+  assert.equal(result.totalBytes, null);
+  assert.deepEqual(result.kvCacheBytesByTp, { "1": 512, "2": 1024, "4": 2048, "8": 4096 });
+  assert.deepEqual(result.totalBytesByTp, { "1": 516, "2": 1028, "4": 2052, "8": 4100 });
+  assert.equal(result.files.safetensors.kvCache, null);
+  assert.deepEqual(Object.keys(result.files.safetensors.kvCacheByTp), ["1", "2", "4", "8"]);
+  for (const tp of ["1", "2", "4", "8"]) {
+    assert.equal(result.files.safetensors.kvCacheByTp[tp].tensorParallelSize, Number(tp));
+    assert.equal(result.files.safetensors.kvCacheByTp[tp].bytes, result.kvCacheBytesByTp[tp]);
+  }
+});
+
+test("CLI text shows each default TP cache and its own total, but explicit TP remains single", () => {
+  const options = { TEST_CACHE_CONFIG: JSON.stringify({
+    hidden_size: 32, num_hidden_layers: 2, num_attention_heads: 8, num_key_value_heads: 1,
+    max_position_embeddings: 16, dtype: "float16",
+  }) };
+  const comparison = invoke(["org/model", "--kv-cache"], options);
+  assert.equal(comparison.status, 0, comparison.stderr);
+  for (const [tp, cache, total] of [[1, 512, 516], [2, 1024, 1028], [4, 2048, 2052], [8, 4096, 4100]]) {
+    assert.match(comparison.stdout, new RegExp(`TP\\s+${tp}\\b[^\\n]*\\b${cache} bytes\\b[^\\n]*\\b${total} bytes\\b`));
+  }
+  const explicit = invoke(["org/model", "--kv-cache", "--tensor-parallel-size", "3"], options);
+  assert.equal(explicit.status, 0, explicit.stderr);
+  assert.match(explicit.stdout, /\b1536 bytes\b/);
+  assert.doesNotMatch(explicit.stdout, /^\s*TP\s+[1248]\b/m);
+});
+
+test("CLI rejects TP zero before requesting metadata", () => {
+  const child = invoke(["org/model", "--kv-cache", "--tensor-parallel-size", "0", "--json"], { TEST_DENY: "true" });
+  assert.equal(child.status, 1);
+  assert.equal(child.stdout, "");
+  assert.match(child.stderr, /--tensor-parallel-size.*positive integer/);
+  assert.doesNotMatch(child.stderr, /401/);
 });

@@ -1,5 +1,6 @@
 import { assertPositiveInteger, fetchRange } from "./http.js";
-import type { ComponentStats, FetchLike, KvCacheEstimate, WeightMetadata } from "./types.js";
+import { estimateSafetensorsKvCache } from "./kv-cache.js";
+import type { ComponentStats, FetchLike, KvCacheEstimate, KvCacheOptions, WeightMetadata } from "./types.js";
 
 // GGML block layouts: gguf-py/gguf/constants.py and ggml/src/ggml-common.h.
 // Q8_1 uses the C layout (two fp16 scales); the Python table still lists fp32 scales.
@@ -159,28 +160,168 @@ export async function fetchGgufMetadata(fetcher: FetchLike, url: string, headers
   }
 }
 
-const KV_SUFFIXES = ["block_count", "head_count_kv", "head_count", "embedding_length", "context_length"] as const;
-
 export function estimateGgufKvCache(
   metadata: Record<string, unknown>,
-  options: { maxModelLen?: number; batchSize?: number; dtype?: string } = {},
+  options: KvCacheOptions = {},
 ): KvCacheEstimate {
-  const values: Record<string, number> = {};
-  for (const suffix of KV_SUFFIXES) {
-    const entry = Object.entries(metadata).find(([key]) => key.endsWith(suffix));
-    if (entry && Number.isSafeInteger(entry[1]) && (entry[1] as number) > 0) values[suffix] = entry[1] as number;
+  const assumptions: string[] = [];
+  let architecture = metadata["general.architecture"];
+  if (architecture !== undefined && (typeof architecture !== "string" || !architecture.trim())) {
+    throw new Error("GGUF general.architecture must be a nonempty string.");
   }
-  if (options.maxModelLen !== undefined) values.context_length = options.maxModelLen;
-  const missing = KV_SUFFIXES.filter((key) => !values[key]);
-  if (missing.length) throw new Error(`GGUF metadata lacks KV-cache fields: ${missing.join(", ")}.`);
-  const dtype = (options.dtype ?? "F16").toUpperCase() === "AUTO" ? "F16" : (options.dtype ?? "F16").toUpperCase();
-  const bits = GGUF_DTYPE_BITS[dtype];
-  if (bits === undefined) throw new Error(`Unsupported GGUF KV-cache dtype: ${dtype}.`);
-  const batchSize = options.batchSize ?? 1;
-  if (!Number.isSafeInteger(batchSize) || batchSize <= 0) throw new RangeError("batchSize must be a positive safe integer.");
-  const maxModelLen = values.context_length!;
-  const headDim = Math.floor(values.embedding_length! / values.head_count!);
-  const bytes = Math.floor(values.block_count! * 2 * values.head_count_kv! * headDim * maxModelLen * batchSize * bits / 8);
-  if (!Number.isSafeInteger(bytes)) throw new RangeError("KV-cache estimate exceeds JavaScript's safe integer range.");
-  return { bytes, dtype, maxModelLen, batchSize };
+  const hasDimensions = (namespace: string): boolean => ["embedding_length", "attention.head_count",
+    "attention.head_count_kv", "attention.key_length", "attention.key_length_mla", "attention.kv_lora_rank",
+    "ssm.state_size", "ssm.inner_size"].some((suffix) => metadata[`${namespace}.${suffix}`] !== undefined);
+  if (architecture === undefined || metadata[`${architecture}.block_count`] === undefined || !hasDimensions(architecture as string)) {
+    const namespaces = Object.keys(metadata).filter((key) => /^[^.]+\.block_count$/.test(key))
+      .map((key) => key.slice(0, -".block_count".length)).filter(hasDimensions);
+    if (namespaces.length !== 1) {
+      throw new Error("GGUF cache estimation requires one unambiguous namespace with block_count and cache dimensions.");
+    }
+    architecture = namespaces[0]!;
+    assumptions.push(`GGUF cache dimensions select the ${architecture} namespace because general.architecture does not identify usable block metadata.`);
+  }
+  const field = (...suffixes: string[]): unknown => {
+    for (const suffix of suffixes) {
+      const value = metadata[`${architecture}.${suffix}`];
+      if (value !== undefined) return value;
+    }
+    return undefined;
+  };
+  const positive = (value: unknown, name: string): number => {
+    if (!Number.isSafeInteger(value) || (value as number) <= 0) throw new RangeError(`${name} must be a positive safe integer.`);
+    return value as number;
+  };
+  const layers = positive(field("block_count"), "block_count");
+  const config: Record<string, unknown> = { num_hidden_layers: layers, torch_dtype: "float16" };
+  const mappings: ReadonlyArray<readonly [string, ...string[]]> = [
+    ["hidden_size", "embedding_length"],
+    ["max_position_embeddings", "context_length"],
+    ["num_attention_heads", "attention.head_count"],
+    ["num_key_value_heads", "attention.head_count_kv"],
+    ["key_head_dim", "attention.key_length_mla", "attention.key_length"],
+    ["value_head_dim", "attention.value_length_mla", "attention.value_length"],
+    ["global_num_attention_heads", "attention.head_count_global"],
+    ["global_num_key_value_heads", "attention.head_count_kv_global"],
+    ["global_key_head_dim", "attention.key_length_global"],
+    ["global_value_head_dim", "attention.value_length_global"],
+    ["sliding_window", "attention.sliding_window"],
+    ["sliding_window_pattern", "attention.sliding_window_pattern"],
+    ["full_attention_interval", "full_attention_interval", "attention.full_attention_interval"],
+    ["layer_types", "layer_types", "attention.layer_types"],
+    ["kv_lora_rank", "attention.kv_lora_rank"],
+    ["qk_rope_head_dim", "rope.dimension_count"],
+    ["state_size", "ssm.state_size"],
+    ["intermediate_size", "ssm.inner_size"],
+    ["conv_kernel", "ssm.conv_kernel"],
+    ["n_groups", "ssm.group_count"],
+    ["linear_num_key_heads", "linear_num_key_heads", "attention.linear_num_key_heads"],
+    ["linear_num_value_heads", "linear_num_value_heads", "attention.linear_num_value_heads"],
+    ["linear_key_head_dim", "linear_key_head_dim", "attention.linear_key_head_dim"],
+    ["linear_value_head_dim", "linear_value_head_dim", "attention.linear_value_head_dim"],
+    ["linear_conv_kernel_dim", "linear_conv_kernel_dim", "attention.linear_conv_kernel_dim"],
+    ["index_head_dim", "attention.indexer.key_length", "attention.indexer.head_dim"],
+    ["index_kv_heads", "attention.indexer.head_count_kv"],
+    ["index_compress_ratio", "attention.indexer.compress_ratio"],
+  ];
+  for (const [key, ...suffixes] of mappings) {
+    const value = field(...suffixes);
+    if (value !== undefined) config[key] = value;
+  }
+  // GGUF's unsuffixed dimensions describe full attention; _swa overrides sliding layers.
+  for (const [key, suffix] of [["key_head_dim", "key_length"], ["value_head_dim", "value_length"],
+    ["num_attention_heads", "head_count"], ["num_key_value_heads", "head_count_kv"]] as const) {
+    const sliding = field(`attention.${suffix}_swa`);
+    if (sliding !== undefined) {
+      config[`global_${key}`] ??= config[key];
+      config[key] = sliding;
+    }
+  }
+  if (config.n_groups === 0) delete config.n_groups;
+  if (config.kv_lora_rank === 0) delete config.kv_lora_rank;
+  if (config.kv_lora_rank === undefined) delete config.qk_rope_head_dim;
+  if (config.sliding_window === 0) delete config.sliding_window;
+  const hasSsm = Object.keys(metadata).some((key) => key.startsWith(`${architecture}.ssm.`));
+  if (hasSsm) {
+    // time_step_rank is NOT a portable head count: GGUF uses it for several different SSM layouts.
+    assumptions.push("GGUF SSM dimensions use generic inner-size × state-size recurrent storage and convolution channels including grouped state inputs; time_step_rank is not treated as an attention head count. Backend history may retain kernel−1 rather than kernel convolution slots.");
+  }
+  const recurrent = field("attention.recurrent_layers");
+  const slidingPattern = config.sliding_window_pattern;
+  const headFields = [config.num_attention_heads, config.num_key_value_heads];
+  const hasZeroHeads = headFields.some((value) => Array.isArray(value) ? value.includes(0) : value === 0);
+  const at = (value: unknown, index: number): unknown => Array.isArray(value) ? value[index % value.length] : value;
+  const flag = (value: unknown, name: string): boolean => {
+    if (value !== true && value !== false && value !== 0 && value !== 1) {
+      throw new RangeError(`${name} must contain boolean or 0/1 flags.`);
+    }
+    return value === true || value === 1;
+  };
+  if (recurrent !== undefined || hasZeroHeads || Array.isArray(slidingPattern) || slidingPattern === 0) {
+    if (layers > 100_000) throw new RangeError("Per-layer cache descriptions are limited to 100000 layers.");
+    for (const [name, value] of [["attention.recurrent_layers", recurrent],
+      ["attention.sliding_window_pattern", slidingPattern], ["layer_types", config.layer_types],
+      ["attention.head_count", config.num_attention_heads], ["attention.head_count_kv", config.num_key_value_heads]] as const) {
+      if (Array.isArray(value) && !value.length) throw new RangeError(`${name} must not be empty.`);
+      if (Array.isArray(value) && value.length !== layers) assumptions.push(`${name} has a different length than block_count; repeating/truncating its per-layer schedule.`);
+    }
+    if (config.layer_types !== undefined && !Array.isArray(config.layer_types)) {
+      throw new RangeError("layer_types must be an array.");
+    }
+    const fullInterval = config.full_attention_interval === undefined ? undefined
+      : positive(config.full_attention_interval, "full_attention_interval");
+    const slidingInterval = slidingPattern === undefined || Array.isArray(slidingPattern) || slidingPattern === 0
+      ? undefined : positive(slidingPattern, "attention.sliding_window_pattern");
+    config.layer_types = Array.from({ length: layers }, (_, index) => {
+      if (recurrent !== undefined && flag(at(recurrent, index), "attention.recurrent_layers")) return "ssm";
+      if (headFields.some((value) => at(value, index) === 0)) return "ssm";
+      if (Array.isArray(config.layer_types)) return at(config.layer_types, index);
+      if (recurrent === undefined && fullInterval !== undefined && (index + 1) % fullInterval !== 0) return "ssm";
+      const sliding = Array.isArray(slidingPattern) ? flag(at(slidingPattern, index), "attention.sliding_window_pattern")
+        : slidingPattern === 0 || (slidingInterval !== undefined ? (index + 1) % slidingInterval !== 0 : config.sliding_window !== undefined);
+      return sliding ? "sliding_attention" : "full_attention";
+    });
+    delete config.sliding_window_pattern;
+    if (hasZeroHeads) assumptions.push("Zero GGUF attention-head entries identify recurrent layers; missing recurrent dimensions use an attention-sized proxy rather than dropping their state.");
+  }
+  if (field("attention.causal") === false || Object.keys(metadata).some((key) =>
+    key.startsWith(`${architecture}.`) && /(^|\.)(encoder|cross_attention|decoder_start_token_id)(\.|$)/.test(key))) {
+    assumptions.push("Noncausal, encoder or cross-attention metadata is estimated using autoregressive resident-cache dimensions; encoder/source lengths and backend cache lifetime are not modeled.");
+  }
+  if (Object.keys(metadata).some((key) => key.startsWith(`${architecture}.`) && /shared_kv|kv_shared/.test(key))) {
+    assumptions.push("GGUF KV sharing is not deducted; each layer is allocated independently.");
+  }
+  if (field("attention.kv_lora_rank_swa", "attention.key_length_mla_swa", "attention.value_length_mla_swa", "rope.dimension_count_swa") !== undefined) {
+    assumptions.push("Sliding-specific MLA/RoPE metadata uses the common compressed latent layout; backend-specific mixed latent layouts are not modeled.");
+  }
+  const requested = options.dtype === undefined ? "auto" : options.dtype;
+  if (typeof requested !== "string" || !requested.trim()) throw new Error("GGUF KV-cache dtype must be a nonempty string.");
+  const selected = requested.toUpperCase() === "AUTO"
+    ? field("attention.kv_cache_dtype", "kv_cache_dtype") ?? metadata["general.kv_cache_dtype"] ?? "F16"
+    : requested;
+  let dtype = typeof selected === "string" ? selected.toUpperCase() : "";
+  if (!Object.hasOwn(GGUF_DTYPE_BITS, dtype)) {
+    if (requested.toUpperCase() !== "AUTO") throw new Error(`Unsupported GGUF KV-cache dtype: ${requested}.`);
+    assumptions.push(`Unrecognized GGUF cache precision ${String(selected)}; assuming F16.`);
+    dtype = "F16";
+  }
+  const bits = GGUF_DTYPE_BITS[dtype]!;
+  const estimate = estimateSafetensorsKvCache(config, { ...options, dtype: "F16" });
+  const attentionBytes = Math.ceil(estimate.attentionBytes / 16 * bits);
+  const indexerBytes = Math.ceil(estimate.indexerBytes / 16 * bits);
+  const bytes = attentionBytes + estimate.stateBytes;
+  if (!Number.isSafeInteger(attentionBytes) || !Number.isSafeInteger(bytes) || attentionBytes < 0 || bytes < 0) {
+    throw new RangeError("Cache estimate exceeds JavaScript's safe integer range.");
+  }
+  const quantized = DTYPE_BLOCKS[dtype]![0] > 1;
+  if (quantized) {
+    assumptions.push(`GGUF ${dtype} uses ${bits} effective bits per attention-cache element including block scales, rounded up to whole bytes; row packing, block alignment and backend padding are unknown, so this is approximate, not a backend dtype-support guarantee.`);
+  }
+  return {
+    ...estimate, dtype, bytes, attentionBytes, indexerBytes,
+    approximate: estimate.approximate || assumptions.length > 0,
+    assumptions: [...estimate.assumptions,
+      `GGUF ${architecture} is a metadata namespace, not a cache-layout restriction. Auto cache precision uses explicit cache dtype metadata or F16, independent of weight quantization; only attention storage is rescaled to ${dtype}.`,
+      ...assumptions],
+  };
 }
