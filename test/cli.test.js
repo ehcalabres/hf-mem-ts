@@ -1,180 +1,246 @@
+import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
-import test from "node:test";
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
-const cli = new URL("../dist/cli.js", import.meta.url).href;
+import { llamaConfig, llamaTensors, tmpPath, writeGguf, writeJson, writeSafetensors } from "./helpers.js";
+import { VERSION } from "../dist/index.js";
+import { bar, where } from "../dist/render.js";
+import { main } from "../dist/cli.js";
 
-function invoke(args, options = {}, timeout = 10_000) {
-  const setup = `
-    const args = JSON.parse(process.env.TEST_ARGS);
-    process.argv = [process.execPath, ${JSON.stringify(cli)}, ...args];
-    const header = Buffer.from(JSON.stringify({ weight: { dtype: 'F16', shape: [2], data_offsets: [0, 4] } }));
-    const file = Buffer.alloc(8 + header.length + 4);
-    file.writeBigUInt64LE(BigInt(header.length)); header.copy(file, 8);
-    let failures = Number(process.env.TEST_TRANSIENT_FAILURES ?? 0);
-    globalThis.fetch = async (input, init) => {
-      if (process.env.TEST_DENY === 'true') return new Response('denied', { status: 401 });
-      if (new Headers(init?.headers).get('authorization') !== process.env.TEST_EXPECT_TOKEN) throw Error('Incorrect authorization');
-      if (process.env.TEST_STALL_BODY === 'true') return new Response(new ReadableStream({}));
-      if (failures > 0) {
-        failures--;
-        return new Response('temporarily unavailable', { status: 503, headers: { 'Retry-After': '0' } });
-      }
-      const url = String(input);
-      if (url.includes('/tree/')) return Response.json([
-        { type: 'file', path: 'model.safetensors' },
-        ...(process.env.TEST_CACHE_CONFIG ? [{ type: 'file', path: 'config.json' }] : []),
-      ]);
-      if (url.includes('/api/models/')) return Response.json({ sha: 'a'.repeat(40) });
-      if (url.endsWith('config.json')) return Response.json(JSON.parse(process.env.TEST_CACHE_CONFIG));
-      const range = new Headers(init.headers).get('range').match(/bytes=(\\d+)-(\\d+)/);
-      if (!range) throw Error('Expected a range request');
-      const start = Number(range[1]); const end = Math.min(Number(range[2]), file.length - 1);
-      return new Response(file.subarray(start, end + 1), { status: 206, headers: { 'Content-Range': 'bytes ' + start + '-' + end + '/' + file.length } });
-    };
-    await import(${JSON.stringify(cli)});
-  `;
-  return spawnSync(process.execPath, ["--input-type=module", "--eval", setup], {
-    encoding: "utf8",
-    timeout,
-    env: { ...process.env, TEST_ARGS: JSON.stringify(args), TEST_EXPECT_TOKEN: "Bearer environment-token", HF_TOKEN: "environment-token", ...options },
+const ARCH = {
+  "general.architecture": "llama",
+  "llama.block_count": 4,
+  "llama.context_length": 2048,
+  "llama.embedding_length": 256,
+  "llama.attention.head_count": 8,
+  "llama.attention.head_count_kv": 2,
+};
+const TENSORS = [
+  ["token_embd.weight", 12, [256, 1000]],
+  ["output_norm.weight", 0, [256]],
+  ["blk.0.attn_q.weight", 8, [256, 256]],
+];
+
+function model() {
+  const tmp = tmpPath();
+  writeSafetensors(join(tmp, "model.safetensors"), llamaTensors());
+  writeJson(join(tmp, "config.json"), llamaConfig());
+  return tmp;
+}
+
+async function cli(...args) {
+  let out = "";
+  let err = "";
+  const code = await main(args, {
+    stdout: { write: (chunk) => (out += chunk) },
+    stderr: { write: (chunk) => (err += chunk) },
+  });
+  return [code, out, err];
+}
+
+const widths = (out) => new Set(out.split("\n").filter(Boolean).map((line) => Array.from(line).length));
+
+test("table", async () => {
+  const [code, out, err] = await cli(model());
+  assert.equal(code, 0);
+  assert.ok(out.includes("TOTAL MEMORY") && out.includes("KV CACHE (1024 TOKENS") && out.includes("MODEL ("));
+  assert.ok(out.includes(`hf-mem-ts v${VERSION}`));
+  assert.ok(!out.includes("\x1b[") && err === "");
+  assert.equal(widths(out).size, 1);
+});
+
+test("table without context length", async () => {
+  const path = model();
+  const config = llamaConfig();
+  delete config.max_position_embeddings;
+  writeJson(join(path, "config.json"), config);
+
+  const [code, out, err] = await cli(path);
+
+  assert.equal(code, 0);
+  assert.ok(out.includes("MODEL (") && out.includes("BF16") && out.includes("F32"));
+  assert.ok(!out.includes("KV CACHE ("));
+  assert.ok(err.includes("KV cache estimation skipped, as the context length is not in `config.json`"));
+  assert.equal(widths(out).size, 1);
+});
+
+for (const [tty, color, noColor, expected] of [
+  [true, false, false, false],
+  [true, true, false, true],
+  [true, true, true, false],
+  [false, true, false, false],
+]) {
+  test(`terminal color is opt in (tty=${tty}, color=${color}, no_color=${noColor})`, async () => {
+    const isTTY = process.stdout.isTTY;
+    const env = process.env.NO_COLOR;
+    process.stdout.isTTY = tty;
+    delete process.env.NO_COLOR;
+    if (noColor) process.env.NO_COLOR = "1";
+    try {
+      const [code, out] = await cli(model(), ...(color ? ["--color"] : []));
+      assert.equal(code, 0);
+      assert.equal(out.includes("\x1b["), expected);
+      assert.ok(out.includes("TOTAL MEMORY"));
+    } finally {
+      process.stdout.isTTY = isTTY;
+      if (env === undefined) delete process.env.NO_COLOR;
+      else process.env.NO_COLOR = env;
+    }
   });
 }
 
-test("CLI prints valid JSON and honors explicit authentication over HF_TOKEN", () => {
-  for (const [args, expected] of [
-    [["org/model", "--json"], "Bearer environment-token"],
-    [["org/model", "--json", "--token", "explicit-token"], "Bearer explicit-token"],
-  ]) {
-    const child = invoke(args, { TEST_EXPECT_TOKEN: expected });
-    assert.equal(child.status, 0, child.stderr);
-    assert.equal(child.stderr, "");
-    const result = JSON.parse(child.stdout);
-    assert.equal(result.weightsBytes, 4);
-    assert.equal(result.totalBytes, 4);
-    assert.equal(result.kvCacheBytes, null);
-    assert.equal(result.kvCacheBytesByTp, null);
-    assert.equal(result.totalBytesByTp, null);
+test("json", async () => {
+  const [code, out] = await cli(model(), "-o", "json", "--max-model-len", "10", "--batch-size", "2");
+  const data = JSON.parse(out);
+  assert.equal(code, 0);
+  const keys = [
+    "version",
+    "model",
+    "revision",
+    "file",
+    "format",
+    "total",
+    "weights",
+    "offloaded",
+    "components",
+    "kv_cache",
+    "overhead",
+    "moe",
+    "fit",
+    "warnings",
+  ];
+  assert.deepEqual(Object.keys(data), keys);
+  assert.equal(data.version, `hf-mem-ts@${VERSION}`);
+  assert.ok(data.kv_cache.max_model_len === 10 && data.kv_cache.batch_size === 2);
+  assert.equal(data.total, data.weights.bytes + data.kv_cache.bytes + data.overhead.bytes);
+});
+
+test("gpu fit", async () => {
+  const path = model();
+  let [code, out, err] = await cli(path, "--gpu-memory", "2x4", "-o", "json");
+  const fit = JSON.parse(out).fit;
+  assert.ok(code === 0 && fit.gpus === 2 && fit.needed === 1 && fit.fits);
+  assert.equal(fit.max_model_len, 1024);
+  [code, out] = await cli(path, "--gpu-memory", "4");
+  assert.ok(code === 0 && out.includes("GPU MEMORY") && out.includes("/ 4.00 GiB [") && out.includes("│ FITS "));
+  [code, out] = await cli(path, "--gpu-memory", "2x4");
+  assert.ok(out.includes("FITS ON 1 GPU") && out.includes("/ 8.00 GiB ["));
+  [code, out] = await cli(path, "--gpu-memory", "2x4", "--output", "markdown");
+  assert.ok(out.includes("| Overhead (activations, graphs, runtime) |"));
+  assert.ok(out.includes("Fits on 2 x 4.00 GiB, needs 1 GPU, up to 1024 tokens."));
+  [code, out] = await cli(path, "--gpu-memory", "0.5");
+  assert.ok(out.includes("⚠ NEEDS 2 GPUS") || out.includes("⚠ DOES NOT FIT"));
+  [code, , err] = await cli(path, "--gpu-memory", "lots");
+  assert.ok(code === 1 && err.includes("--gpu-memory"));
+});
+
+test("markdown", async () => {
+  const [code, out] = await cli(model(), "--output", "markdown");
+  assert.equal(code, 0);
+  assert.ok(out.includes("| **Total** |") && out.includes("| KV cache (BF16, 1024 tokens x 1) |"));
+});
+
+test("removed flags", async () => {
+  const path = model();
+  for (const flag of ["--model-id", "--experimental", "--json", "--markdown", "--json-output", "--details", "--gguf-file"]) {
+    const [code, , err] = await cli(path, flag, "x");
+    assert.ok(code === 2 && err.includes("unrecognized arguments"), flag);
   }
 });
 
-test("CLI keeps request failures on stderr and does not emit partial JSON", () => {
-  const child = invoke(["org/model", "--json"], { TEST_DENY: "true" });
-  assert.equal(child.status, 1);
-  assert.equal(child.stdout, "");
-  assert.match(child.stderr, /401/);
-  assert.doesNotMatch(child.stderr, /environment-token/);
+test("gguf listing table", async () => {
+  const tmp = tmpPath();
+  for (const quant of ["Q4_K_M", "Q8_0"]) writeGguf(join(tmp, `m-${quant}.gguf`), ARCH, TENSORS);
+  let [code, out] = await cli(tmp, "--file", "m-Q8_0.gguf", "-o", "json");
+  assert.ok(code === 0 && JSON.parse(out).file === "m-Q8_0.gguf");
+  [code, out] = await cli(tmp);
+  assert.ok(code === 0 && out.includes("FILES") && out.includes("m-Q4_K_M.gguf"));
+  assert.ok(out.includes("GiB WEIGHTS +") && out.includes("GiB OVERHEAD)"));
 });
 
-test("CLI rejects an invalid context before making network requests", () => {
-  const child = invoke(["org/model", "--max-model-len", "0.5"], { TEST_DENY: "true" });
-  assert.equal(child.status, 1);
-  assert.equal(child.stdout, "");
-  assert.match(child.stderr, /--max-model-len.*positive integer/);
-  assert.doesNotMatch(child.stderr, /401/);
+test("errors", async () => {
+  const tmp = tmpPath();
+  let [code, , err] = await cli(join(tmp, "missing"));
+  assert.ok(code === 1 && err.startsWith("hf-mem-ts: error:"));
+  [code, , err] = await cli();
+  assert.ok(code === 2 && err.includes("required"));
+  [code] = await cli(tmp, "--batch-size", "0");
+  assert.equal(code, 2);
 });
 
-test("CLI help does not require a model or network access", () => {
-  const output = execFileSync(process.execPath, [new URL("../dist/cli.js", import.meta.url).pathname, "--help"], { encoding: "utf8" });
-  assert.match(output, /--draft-gguf-file/);
-  assert.match(output, /--kv-cache/);
+test("version", async () => {
+  const [code, out] = await cli("--version");
+  assert.ok(code === 0 && out.trim() === `hf-mem-ts ${VERSION}`);
 });
 
-test("CLI honors zero retries and can recover with a larger explicit retry budget", () => {
-  const disabled = invoke(["org/model", "--json", "--max-retries", "0"], { TEST_TRANSIENT_FAILURES: "1" });
-  assert.equal(disabled.status, 1, disabled.stderr);
-  assert.equal(disabled.stdout, "");
-  assert.match(disabled.stderr, /503/);
-
-  const recovered = invoke(["org/model", "--json", "--max-retries", "3"], { TEST_TRANSIENT_FAILURES: "3" });
-  assert.equal(recovered.status, 0, recovered.stderr);
-  assert.equal(recovered.stderr, "");
-  assert.equal(JSON.parse(recovered.stdout).totalBytes, 4);
-});
-
-test("CLI request deadline interrupts a stalled metadata response body", () => {
-  const child = invoke(["org/model", "--json", "--request-timeout-ms", "50"], { TEST_STALL_BODY: "true" }, 2_000);
-  assert.equal(child.status, 1, child.stderr || child.error?.message);
-  assert.equal(child.stdout, "");
-  assert.match(child.stderr, /Metadata request timed out/);
-});
-
-test("CLI rejects out-of-range request policies before making network requests", () => {
-  for (const [flag, value, error] of [
-    ["--request-timeout-ms", "0", /--request-timeout-ms.*positive integer/],
-    ["--request-timeout-ms", "2147483648", /requestTimeoutMs.*between 1 and 2147483647/],
-    ["--max-retries", "0.5", /--max-retries.*non-negative integer/],
-    ["--max-retries", "11", /maxRetries.*between 0 and 10/],
-  ]) {
-    const child = invoke(["org/model", flag, value], { TEST_DENY: "true" });
-    assert.equal(child.status, 1);
-    assert.equal(child.stdout, "");
-    assert.match(child.stderr, error);
-    assert.doesNotMatch(child.stderr, /401/);
+test("titles shorten paths and commits", () => {
+  const tmp = realpathSync(tmpPath());
+  mkdirSync(join(tmp, "cwd"));
+  const cwd = process.cwd();
+  const home = process.env.HOME;
+  process.chdir(join(tmp, "cwd"));
+  process.env.HOME = join(tmp, "home");
+  try {
+    assert.equal(where(join(tmp, "cwd", "m"), "a".repeat(40)), "m @ aaaaaaa");
+    assert.equal(where(join(tmp, "home", "m"), null), "~/m");
+    assert.equal(where("https://hf.co/org/model", "main"), "https://hf.co/org/model @ main");
+    const long = where("https://hf.co/org/" + "x".repeat(200), null);
+    assert.ok(long.length === 72 && long.startsWith("...") && long.endsWith("x"));
+  } finally {
+    process.chdir(cwd);
+    if (home === undefined) delete process.env.HOME;
+    else process.env.HOME = home;
   }
 });
 
-test("CLI tensor parallelism changes aggregate KV payload and is inherited by the draft", () => {
-  const config = JSON.stringify({
-    hidden_size: 32, num_hidden_layers: 2, num_attention_heads: 8, num_key_value_heads: 1,
-    max_position_embeddings: 16, dtype: "float16",
+test("version matches package.json", () => {
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf-8"));
+  assert.equal(pkg.version, VERSION);
+});
+
+test("errors are actionable", async () => {
+  const tmp = tmpPath();
+  writeFileSync(join(tmp, "pytorch_model.bin"), Buffer.alloc(1000));
+  writeFileSync(join(tmp, "optimizer.pt"), Buffer.alloc(10));
+  let [code, , err] = await cli(tmp);
+  assert.ok(code === 1 && err.includes("only has PyTorch pickle weights (e.g. `pytorch_model.bin`)"));
+  [code, , err] = await cli(join(tmp, "missing"));
+  assert.ok(code === 1 && err.includes("does not exist"));
+  [code, , err] = await cli("not-a-model");
+  assert.ok(code === 1 && err.includes("is not a Hub model ID (`org/name`)"));
+});
+
+test("bars show small fractions", () => {
+  assert.equal(bar(0.0, 4), "░░░░");
+  assert.equal(bar(0.001, 4), "▏░░░");
+  assert.equal(bar(0.5, 4), "██░░");
+  assert.equal(bar(0.3, 4), "█▎░░");
+  assert.equal(bar(1.0, 4), "████");
+  for (let f = 0; f <= 100; f++) assert.equal(Array.from(bar(f / 100, 7)).length, 7);
+});
+
+test("encoder table", async () => {
+  const tmp = tmpPath();
+  writeSafetensors(join(tmp, "model.safetensors"), { w: ["F32", [1000, 64]] });
+  writeJson(join(tmp, "config.json"), llamaConfig({ architectures: ["BertModel"] }));
+  const [code, out, err] = await cli(tmp, "--max-num-batched-tokens", "512");
+  assert.ok(code === 0 && err.includes("Encoder warmup"));
+  assert.ok(out.includes("MODEL (") && out.includes("ACTIVATIONS") && !out.includes("KV CACHE"));
+});
+
+for (const [dtype, target, size] of [
+  ["float16", "F16", 2],
+  ["bfloat16", "BF16", 2],
+  ["float32", "F32", 4],
+]) {
+  test(`encoder dtype option (${dtype})`, async () => {
+    const tmp = tmpPath();
+    writeSafetensors(join(tmp, "model.safetensors"), { w: ["F32", [1000, 64]] });
+    writeJson(join(tmp, "config.json"), llamaConfig({ architectures: ["BertModel"] }));
+    const [code, out, err] = await cli(tmp, "--dtype", dtype, "--output", "json");
+    const result = JSON.parse(out);
+    assert.ok(code === 0 && err === "");
+    assert.deepEqual(result.weights.dtypes, { [target]: { bytes: 64000 * size, params: 64000 } });
   });
-  const child = invoke(["org/model", "--kv-cache", "--tensor-parallel-size", "4", "--draft-model", "org/draft", "--json"], { TEST_CACHE_CONFIG: config });
-  assert.equal(child.status, 0, child.stderr);
-  const result = JSON.parse(child.stdout);
-  assert.equal(result.kvCacheBytes, 2048);
-  assert.equal(result.draft.kvCacheBytes, 2048);
-  assert.equal(result.totalBytes, 4104);
-  assert.equal(result.kvCacheBytesByTp, null);
-  assert.equal(result.totalBytesByTp, null);
-  assert.equal(result.files.safetensors.kvCacheByTp, null);
-  assert.equal(result.draft.kvCacheBytesByTp, null);
-  assert.equal(result.draft.totalBytesByTp, null);
-});
-
-test("CLI default cache JSON exposes all TP alternatives without choosing a scalar total", () => {
-  const child = invoke(["org/model", "--kv-cache", "--json"], {
-    TEST_CACHE_CONFIG: JSON.stringify({
-      hidden_size: 32, num_hidden_layers: 2, num_attention_heads: 8, num_key_value_heads: 1,
-      max_position_embeddings: 16, dtype: "float16",
-    }),
-  });
-  assert.equal(child.status, 0, child.stderr);
-  assert.equal(child.stderr, "");
-  const result = JSON.parse(child.stdout);
-  assert.equal(result.weightsBytes, 4);
-  assert.equal(result.kvCacheBytes, null);
-  assert.equal(result.totalBytes, null);
-  assert.deepEqual(result.kvCacheBytesByTp, { "1": 512, "2": 1024, "4": 2048, "8": 4096 });
-  assert.deepEqual(result.totalBytesByTp, { "1": 516, "2": 1028, "4": 2052, "8": 4100 });
-  assert.equal(result.files.safetensors.kvCache, null);
-  assert.deepEqual(Object.keys(result.files.safetensors.kvCacheByTp), ["1", "2", "4", "8"]);
-  for (const tp of ["1", "2", "4", "8"]) {
-    assert.equal(result.files.safetensors.kvCacheByTp[tp].tensorParallelSize, Number(tp));
-    assert.equal(result.files.safetensors.kvCacheByTp[tp].bytes, result.kvCacheBytesByTp[tp]);
-  }
-});
-
-test("CLI text shows each default TP cache and its own total, but explicit TP remains single", () => {
-  const options = { TEST_CACHE_CONFIG: JSON.stringify({
-    hidden_size: 32, num_hidden_layers: 2, num_attention_heads: 8, num_key_value_heads: 1,
-    max_position_embeddings: 16, dtype: "float16",
-  }) };
-  const comparison = invoke(["org/model", "--kv-cache"], options);
-  assert.equal(comparison.status, 0, comparison.stderr);
-  for (const [tp, cache, total] of [[1, 512, 516], [2, 1024, 1028], [4, 2048, 2052], [8, 4096, 4100]]) {
-    assert.match(comparison.stdout, new RegExp(`TP\\s+${tp}\\b[^\\n]*\\b${cache} bytes\\b[^\\n]*\\b${total} bytes\\b`));
-  }
-  const explicit = invoke(["org/model", "--kv-cache", "--tensor-parallel-size", "3"], options);
-  assert.equal(explicit.status, 0, explicit.stderr);
-  assert.match(explicit.stdout, /\b1536 bytes\b/);
-  assert.doesNotMatch(explicit.stdout, /^\s*TP\s+[1248]\b/m);
-});
-
-test("CLI rejects TP zero before requesting metadata", () => {
-  const child = invoke(["org/model", "--kv-cache", "--tensor-parallel-size", "0", "--json"], { TEST_DENY: "true" });
-  assert.equal(child.status, 1);
-  assert.equal(child.stdout, "");
-  assert.match(child.stderr, /--tensor-parallel-size.*positive integer/);
-  assert.doesNotMatch(child.stderr, /401/);
-});
+}
