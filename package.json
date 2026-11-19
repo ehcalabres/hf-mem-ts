@@ -1,7 +1,7 @@
 {
   "name": "hf-mem-ts",
-  "version": "0.1.0",
-  "description": "Estimate Hugging Face model inference memory from Safetensors and GGUF metadata",
+  "version": "1.0.0",
+  "description": "TypeScript port of hf-mem: estimate inference memory for Hugging Face models from Safetensors, GGUF and ONNX metadata",
   "type": "module",
   "sideEffects": false,
   "bin": {
@@ -12,21 +12,6 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
-    },
-    "./safetensors": {
-      "types": "./dist/safetensors.d.ts",
-      "import": "./dist/safetensors.js",
-      "default": "./dist/safetensors.js"
-    },
-    "./gguf": {
-      "types": "./dist/gguf.d.ts",
-      "import": "./dist/gguf.js",
-      "default": "./dist/gguf.js"
-    },
-    "./kv-cache": {
-      "types": "./dist/kv-cache.d.ts",
-      "import": "./dist/kv-cache.js",
-      "default": "./dist/kv-cache.js"
     }
   },
   "main": "./dist/index.js",
@@ -46,6 +31,7 @@
     "huggingface",
     "safetensors",
     "gguf",
+    "onnx",
     "llm",
     "memory"
   ],
